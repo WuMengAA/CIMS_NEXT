@@ -5,6 +5,7 @@
 
 import secrets
 from app.core.redis.accessor import get_redis
+from app.core.tenant.context import get_schema
 
 _TOKEN_LENGTH = 64
 _DEFAULT_TTL = 300
@@ -33,6 +34,8 @@ async def create_token(
             "name": name,
             "remaining_uses": str(max_uses),
             "client_ip": client_ip,
+            # 记录生成时的租户 schema：/get 按此读取，避免落库与读取 schema 错位
+            "schema": get_schema(),
         },
     )
     await rd.expire(key, ttl)

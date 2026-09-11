@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 from app.core.redis.accessor import get_redis
 
 
-async def resolve_token(token: str) -> Optional[Tuple[str, str, str, str]]:
+async def resolve_token(token: str) -> Optional[Tuple[str, str, str, str, str]]:
     """将令牌字符串转换为元数据，并递减剩余可用次数。"""
     rd = get_redis()
     key = f"token:{token}"
@@ -27,4 +27,5 @@ async def resolve_token(token: str) -> Optional[Tuple[str, str, str, str]]:
         data["resource_type"],
         data["name"],
         data.get("client_ip", ""),
+        data.get("schema", "public"),
     )
