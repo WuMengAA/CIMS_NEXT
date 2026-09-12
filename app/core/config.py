@@ -49,6 +49,9 @@ class CIMSSettings(BaseSettings):
     # 超级管理员密钥
     cims_admin_secret: str = "change-me"
 
+    # 跨系统账号同步密钥（website 为账号权威时，website 调 CIMS /user/sync-create 建镜像账号用）
+    cims_sync_key: str = ""
+
 
 _settings = CIMSSettings()
 
@@ -90,6 +93,9 @@ GRPC_PORT: int = _settings.cims_grpc_port
 
 # GPG 密钥文件路径
 KEY_FILE: str = _settings.cims_key_file
+
+# 跨系统账号同步密钥（空字符串表示禁用同步接口）
+SYNC_KEY: str = _settings.cims_sync_key
 
 
 def validate_config() -> None:

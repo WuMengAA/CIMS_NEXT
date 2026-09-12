@@ -10,6 +10,7 @@ from .token_verify import router as ver_r
 from .token_deactivate import router as deact_r
 from .user_apply import router as apply_r
 from .user_auth import router as auth_r
+from .user_sync import router as sync_r
 from .user_availability_mail import router as avail_mail_r
 from .user_availability_username import router as avail_uname_r
 from .user_info import router as info_r
@@ -28,6 +29,7 @@ router.include_router(deact_r, prefix="/token", tags=["Token"])
 # /user/*
 router.include_router(apply_r, prefix="/user", tags=["User"])
 router.include_router(auth_r, prefix="/user", tags=["User"])
+router.include_router(sync_r, prefix="/user", tags=["User"])
 router.include_router(info_r, prefix="/user", tags=["User"])
 router.include_router(totp_r, prefix="/user/2fa/totp", tags=["2FA"])
 

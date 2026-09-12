@@ -23,7 +23,7 @@ from app.core.security.codes import ERR_PERM_DENIED, ERR_AUTH_MISSING, ERR_AUTH_
 logger = logging.getLogger(__name__)
 
 # 免认证路径白名单（精确匹配）
-_EXEMPT = {"/", "/user/auth", "/user/apply"}
+_EXEMPT = {"/", "/user/auth", "/user/apply", "/user/sync-create"}
 # 免认证路径前缀（前缀匹配）
 _EXEMPT_PREFIXES = ("/user/availability/",)
 _DENY = JSONResponse(
