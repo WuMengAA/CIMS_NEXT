@@ -6,8 +6,10 @@
 from fastapi import APIRouter
 from .manifest import router as manifest_router
 from .resource import router as resource_router
+from .command_poll import router as command_poll_router
 
 router = APIRouter()
 
 router.include_router(manifest_router)
 router.include_router(resource_router)
+router.include_router(command_poll_router)

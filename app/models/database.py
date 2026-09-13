@@ -24,6 +24,7 @@ from .resource_files import (
     CredentialsFile,
 )
 from .client import ClientRecord, ClientProfile
+from .command_queue import CommandQueueRecord
 from .audit import AuditLog
 from .config_upload import ConfigUploadRecord
 from .engine import AsyncSessionLocal, init_db
@@ -50,6 +51,7 @@ __all__ = [
     "CredentialsFile",
     "ClientRecord",
     "ClientProfile",
+    "CommandQueueRecord",
     "AuditLog",
     "ConfigUploadRecord",
     "AsyncSessionLocal",

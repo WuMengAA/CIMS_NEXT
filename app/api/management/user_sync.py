@@ -17,17 +17,26 @@ from app.core.config import SYNC_KEY
 from app.models.session import get_db
 from app.models.user import User
 from app.services.crypto.hasher import hash_password
+from app.services.user.account_creator import create_account  # 复用现成账号创建服务
 
 router = APIRouter()
 
 
 class SyncCreateRequest(BaseModel):
-    """website 侧传来的账号信息（密码为明文，仅在内部网络一次性传输）。"""
+    """website 侧传来的账号信息（密码为明文，仅在内部网络一次性传输）。
+
+    - `create_account=True` 时，建号后会自动为新用户创建 Account 空间并设其为 owner，
+      使其能触达 `/account/{account_id}/client/*` 设备控制端点（默认 False，向后兼容）。
+    - `account_name` / `account_slug` 仅在 `create_account=True` 时生效，可选。
+    """
 
     email: str
     password: str
     username: str | None = None
     display_name: str | None = None
+    create_account: bool = False
+    account_name: str | None = None
+    account_slug: str | None = None
 
 
 @router.post("/sync-create")
@@ -66,4 +75,22 @@ async def sync_create_user(
     )
     db.add(user)
     await db.commit()
-    return {"ok": True, "created": True, "email": payload.email}
+
+    # 可选：为同步账号创建独立 Account 空间，设该用户为 owner
+    # （打通"账号体系 → 设备控制端点 /account/{account_id}/client/*"的断层）
+    account = None
+    if payload.create_account:
+        name = payload.account_name or payload.username or payload.email
+        account = await create_account(
+            name=name,
+            user_id=user.id,
+            db=db,
+            slug=payload.account_slug,
+        )
+
+    return {
+        "ok": True,
+        "created": True,
+        "email": payload.email,
+        "account_id": account.id if account else None,
+    }

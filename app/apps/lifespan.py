@@ -16,7 +16,12 @@ from app.core.config import (
     GRPC_PORT,
 )
 from app.core.redis.pool import init_redis
-from app.models.database import init_db
+from app.models.database import (
+    init_db,
+    ensure_tenant_schema,
+    AsyncSessionLocal,
+    Account,
+)
 from app.grpc.server.bootstrap import serve_grpc
 from app.core.logging import get_port_logger, PORT_TAG_GRPC
 from app.apps.lifespan_shutdown import _shutdown
@@ -34,10 +39,36 @@ async def app_lifespan(app: FastAPI):
     await _shutdown(app)
 
 
+async def _reconcile_tenant_schemas() -> None:
+    """补建所有已有租户 Schema 中的缺失表。
+
+    新增模型（如 command_queue）时，已存在的租户 Schema 不会自动建表；
+    这里在启动时遍历 accounts（public 表），为每个活跃租户调 ensure_tenant_schema，
+    幂等补建缺失表，避免运行期因缺表而 500。
+    """
+    from sqlalchemy import select
+
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(select(Account.slug))).scalars().all()
+    except Exception as e:  # pragma: no cover
+        logger.warning("读取账户列表失败，跳过租户 Schema 补建: %s", e)
+        return
+
+    for slug in rows:
+        try:
+            await ensure_tenant_schema(slug)
+        except Exception as e:  # pragma: no cover
+            logger.warning("[schema=%s] 租户 Schema 补建失败: %s", slug, e)
+    if rows:
+        logger.info("已完成 %d 个租户 Schema 补齐", len(rows))
+
+
 async def _startup(app: FastAPI):
     """启动所有后端服务。"""
     logger.info("正在初始化数据库连接...")
     await init_db()
+    await _reconcile_tenant_schemas()
     logger.info("正在初始化 Redis 连接池...")
     await init_redis()
     grpc_logger.info("正在启动 gRPC (%d)...", GRPC_PORT)
