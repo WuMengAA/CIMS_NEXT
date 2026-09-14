@@ -26,8 +26,18 @@ class CommandQueueRecord(Base):
     command_type: Mapped[str] = mapped_column(String, default="")
     # 完整载荷（JSON 文本）。通知类为 NotificationPayload；stelarith_task 以原文作封装
     payload: Mapped[str] = mapped_column(Text, default="")
-    # pending=待取走  done=已被教室端轮询取走执行
+    # 消费语义：
+    #   pending   = 未被取走
+    #   delivered = 已被 poller 取走，等待客户端执行确认
+    #   done      = 客户端确认执行完成
+    #   failed    = 客户端确认执行失败（可重试）
+    ack_status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # 旧字段 status 兼容保留（pending/done 语义映射到 ack_status）
     status: Mapped[str] = mapped_column(String, default="pending")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow
     )
+    delivered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    ack_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)

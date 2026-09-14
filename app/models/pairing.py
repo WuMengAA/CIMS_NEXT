@@ -39,3 +39,7 @@ class PairingCode(Base):
     approved: Mapped[bool] = mapped_column(Boolean, default=False)
     # 是否已使用（注册完成）
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 班级码（设备注册时上报，服务端据此绑定班级）
+    class_code: Mapped[str] = mapped_column(String(32), default="")
+    # 审批后落库的目标班级 id
+    class_id: Mapped[str] = mapped_column(String(64), default="")

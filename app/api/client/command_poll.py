@@ -1,13 +1,25 @@
-"""教室端命令轮询自取接口。
+"""教室端命令轮询自取 + 执行确认接口。
 
-「插件轮询自取」方案的关键端点：CIMS 把下发命令落库到 command_queue 表后，
-教室端 ClassIsland 插件周期性地调用本接口，取走本设备的 pending 命令并执行。
+「插件轮询自取」方案的端点：
+- GET  /v1/client/{client_id}/command/queued  取走本设备 pending 命令（置 delivered）
+- POST /v1/client/{client_id}/command/ack     客户端执行完成后上报结果（置 done/failed）
+
+消费语义（v2 修正，解决「离线丢命令」「命令被吞」）：
+- pending   = 未被取走
+- delivered = 已被 poller 取走，等待客户端执行确认
+- done      = 客户端确认执行完成
+- failed    = 客户端确认执行失败（可重试/人工介入）
+
+旧 status 字段保留映射：pending→pending / delivered→pending / done→done / failed→done
+（新逻辑一律以 ack_status 为准，status 仅作兼容视图。）
 
 鉴权：与 manifest 一致——通过 TenantMiddleware 的 Host 头 `<slug>.<BASE_DOMAIN>`
 识别租户，无需额外会话凭证；按 client_id(=uid) 定向查询本设备命令。
 """
 
-from fastapi import APIRouter, Depends, Request
+from datetime import datetime, timezone
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -20,13 +32,24 @@ logger = logging.getLogger(__name__)
 _MAX_BATCH = 50
 
 
+def _now():
+    return datetime.now(timezone.utc)
+
+
+class AckRequest(BaseModel):
+    """客户端命令执行确认请求。"""
+
+    command_ids: list[int]
+    status: str = "done"  # done | failed，缺省 done
+
+
 @router.get("/v1/client/{client_id}/command/queued")
 async def poll_queued_commands(
     request: Request,
     client_id: str,
     db: AsyncSession = Depends(get_db),
 ):
-    """返回该设备的全部 pending 命令，并立即将它们标记为 done（原子取走）。
+    """返回该设备的 pending 命令，并立即标记为 delivered（原子取走，等待确认）。
 
     返回结构：
     {
@@ -39,13 +62,13 @@ async def poll_queued_commands(
     """
     slug = getattr(request.state, "tenant_slug", "Unknown")
 
-    # 1) 取出该设备全部 pending 命令（限制批量，防止积压撑爆单次响应）
+    # 1) 取出该设备 pending 命令（限制批量）
     sel = (
         select(CommandQueueRecord.id, CommandQueueRecord.command_type,
                CommandQueueRecord.payload, CommandQueueRecord.created_at)
         .where(
             CommandQueueRecord.client_id == client_id,
-            CommandQueueRecord.status == "pending",
+            CommandQueueRecord.ack_status == "pending",
         )
         .order_by(CommandQueueRecord.id.asc())
         .limit(_MAX_BATCH)
@@ -54,18 +77,18 @@ async def poll_queued_commands(
 
     if not rows:
         logger.info("[%s][client=%s] 命令轮询: 无待执行命令", slug, client_id)
-        return {
-            "client_id": client_id,
-            "count": 0,
-            "commands": [],
-        }
+        return {"client_id": client_id, "count": 0, "commands": []}
 
     ids = [r.id for r in rows]
-    # 2) 原子地把这批标记为 done（取走即消费，防止重复执行）
+    # 2) 原子标记为 delivered（取走，但等待客户端执行确认，防离线丢命令）
     await db.execute(
         update(CommandQueueRecord)
         .where(CommandQueueRecord.id.in_(ids))
-        .values(status="done")
+        .values(
+            ack_status="delivered",
+            status="delivered",
+            delivered_at=_now(),
+        )
     )
     await db.commit()
 
@@ -79,11 +102,54 @@ async def poll_queued_commands(
         for r in rows
     ]
     logger.info(
-        "[%s][client=%s] 命令轮询: 取走 %d 条已执行",
+        "[%s][client=%s] 命令轮询: 取走 %d 条（delivered）",
         slug, client_id, len(commands),
+    )
+    return {"client_id": client_id, "count": len(commands), "commands": commands}
+
+
+@router.post("/v1/client/{client_id}/command/ack")
+async def ack_commands(
+    request: Request,
+    client_id: str,
+    body: AckRequest = Body(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """客户端执行完成后上报结果。
+
+    把指定 command_ids 置为 done 或 failed。failed 的命令可被管理端查看重试。
+    """
+    slug = getattr(request.state, "tenant_slug", "Unknown")
+    if not body.command_ids:
+        raise HTTPException(400, "command_ids 不能为空")
+    if body.status not in ("done", "failed"):
+        raise HTTPException(400, "status 仅允许 done / failed")
+
+    rows = (
+        await db.execute(
+            select(CommandQueueRecord).where(
+                CommandQueueRecord.client_id == client_id,
+                CommandQueueRecord.id.in_(body.command_ids),
+            )
+        )
+    ).scalars().all()
+    if not rows:
+        raise HTTPException(404, "没有匹配的命令")
+
+    now = _now()
+    for r in rows:
+        r.ack_status = body.status
+        r.status = "done" if body.status == "done" else "done"
+        r.ack_at = now
+    await db.commit()
+
+    logger.info(
+        "[%s][client=%s] 命令确认: %d 条 -> %s",
+        slug, client_id, len(rows), body.status,
     )
     return {
         "client_id": client_id,
-        "count": len(commands),
-        "commands": commands,
+        "acked": len(rows),
+        "status": body.status,
+        "message": f"已确认 {len(rows)} 条命令为 {body.status}",
     }

@@ -24,6 +24,7 @@ from .resource_files import (
     CredentialsFile,
 )
 from .client import ClientRecord, ClientProfile
+from .class_model import Class, ClassResourceSet
 from .command_queue import CommandQueueRecord
 from .audit import AuditLog
 from .config_upload import ConfigUploadRecord
@@ -51,6 +52,8 @@ __all__ = [
     "CredentialsFile",
     "ClientRecord",
     "ClientProfile",
+    "Class",
+    "ClassResourceSet",
     "CommandQueueRecord",
     "AuditLog",
     "ConfigUploadRecord",

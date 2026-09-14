@@ -7,6 +7,7 @@ Schema 隔离后不再需要 tenant_id 列。
 from datetime import datetime
 from sqlalchemy import DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Index
 from .base import Base
 
 
@@ -27,6 +28,8 @@ class ClientProfile(Base):
     __tablename__ = "client_profiles"
 
     client_id: Mapped[str] = mapped_column(String, primary_key=True)
+    class_id: Mapped[str] = mapped_column(String, default="", index=True,
+                                          comment="所属班级 id（空=设备级独立配置，老行为）")
     class_plan: Mapped[str] = mapped_column(String)
     time_layout: Mapped[str] = mapped_column(String)
     subjects: Mapped[str] = mapped_column(String)

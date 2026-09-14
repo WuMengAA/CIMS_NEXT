@@ -18,6 +18,7 @@ from .user_totp import router as totp_r
 from .user_info_email import router as email_r
 from .user_info_username import router as uname_r
 from .user_password import router as pwd_r
+from .class_routes import router as class_r
 
 router = APIRouter()
 
@@ -41,3 +42,6 @@ router.include_router(avail_uname_r, prefix="/user/availability", tags=["Availab
 router.include_router(email_r, prefix="/user/info", tags=["UserInfo"])
 router.include_router(uname_r, prefix="/user/info", tags=["UserInfo"])
 router.include_router(pwd_r, prefix="/user/info/password", tags=["UserInfo"])
+
+# /class/*（Phase 1 班级层）
+router.include_router(class_r, prefix="/class", tags=["Class"])
