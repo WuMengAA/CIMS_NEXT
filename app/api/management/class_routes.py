@@ -1,8 +1,15 @@
 """班级管理路由（Phase 1 班级层 + Phase 2 课表编辑与推送）。
 
+路由挂载约定：本模块被 include 到 management router 的 `prefix="/class"` 下，
+所以这里**只写 / 之后的段**（历史写法把 `class/` 又写了一遍，实际路径变成
+`/class/class/create`，已修正）。
+
 - 班级 CRUD：创建、列表、设备划入/移出。
 - 班级课表写入：POST /class/{class_id}/resource/{resource_type}/write
   事务性：写 *_files 资源内容 + 同步 class_resource_sets 指向；ClassPlan 做引用完整性校验。
+- **手动添加课表**：POST /class/{class_id}/apply-week-template（建空周课表骨架）
+  + 上面的 resource write（逐天填课时），两者都产出官方 Profile 信封格式。
+- **从官方档案导入**：POST /class/import-from-profile（ClassIsland 档案一次切出 N 个班）。
 - 班级命令广播：POST /class/{class_id}/command/{command_type} 展开班级全部设备写 command_queue。
 """
 
@@ -46,6 +53,18 @@ RESOURCE_DEFAULT_NAME = {
     "Credentials": "default",
 }
 
+# resource_type → 班级专属资源名前缀（缺省 name 时生成 cp_<class_id> 之类的独立资源，
+# 避免把某个班的课表写进全校共享的 default_* 资源里而污染其他班级）
+RESOURCE_PREFIX = {
+    "ClassPlan": "cp",
+    "TimeLayout": "tl",
+    "Subjects": "sub",
+    "DefaultSettings": "ds",
+    "Policy": "pol",
+    "Components": "comp",
+    "Credentials": "cred",
+}
+
 DEFAULT_RESOURCE = {
     "class_plan": "default_classplan",
     "time_layout": "default_timelayout",
@@ -61,7 +80,7 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-@router.post("/class/create")
+@router.post("/create")
 async def create_class(
     class_id: str,
     name: str,
@@ -93,7 +112,7 @@ async def create_class(
     }
 
 
-@router.get("/class/list")
+@router.get("/list")
 async def list_classes(db: AsyncSession = Depends(get_db)):
     """列出全部班级（含设备数）。"""
     rows = (await db.execute(select(Class).order_by(Class.sort_order, Class.name))).scalars().all()
@@ -117,7 +136,7 @@ async def list_classes(db: AsyncSession = Depends(get_db)):
     return out
 
 
-@router.post("/class/device/assign")
+@router.post("/device/assign")
 async def assign_device_to_class(
     class_id: str,
     client_id: str,
@@ -140,7 +159,7 @@ async def assign_device_to_class(
     return {"status": "success", "client_id": client_id, "class_id": class_id}
 
 
-@router.post("/class/device/unassign")
+@router.post("/device/unassign")
 async def unassign_device_from_class(
     client_id: str,
     db: AsyncSession = Depends(get_db),
@@ -156,8 +175,8 @@ async def unassign_device_from_class(
     return {"status": "success", "client_id": client_id, "class_id": ""}
 
 
-@router.post("/class/{class_id}/resource/{resource_type}/write")
-@router.put("/class/{class_id}/resource/{resource_type}/write")
+@router.post("/{class_id}/resource/{resource_type}/write")
+@router.put("/{class_id}/resource/{resource_type}/write")
 async def write_class_resource(
     class_id: str,
     resource_type: str,
@@ -188,12 +207,20 @@ async def write_class_resource(
     if crs is None:
         raise HTTPException(404, f"班级 {class_id} 的资源集不存在")
 
-    res_name = name or RESOURCE_DEFAULT_NAME.get(resource_type, "default")
+    current_name = getattr(crs, crs_col, None)
+    default_name = RESOURCE_DEFAULT_NAME.get(resource_type, "default")
+    if name:
+        res_name = name
+    elif current_name and current_name != default_name:
+        # 该班已有专属资源 → 就地编辑，不新建
+        res_name = current_name
+    else:
+        res_name = f"{RESOURCE_PREFIX.get(resource_type, 'res')}_{class_id}"
 
-    # ClassPlan 引用校验：TimeLayoutId 必须存在、科目必须在词典
+    # ClassPlan 引用校验：TimeLayoutId 必须在班级作息资源里存在、科目必须在校科目资源词典里
     if resource_type == "ClassPlan":
-        tl_name = payload.get("TimeLayoutId") or res_name
-        sub_name = getattr(crs, "subjects", "default") or "default"
+        tl_name = getattr(crs, "time_layout", None) or default_name
+        sub_name = getattr(crs, "subjects", None) or "default"
         await validate_classplan_references(db, payload, tl_name, sub_name)
 
     # 写 *_files 资源内容（与 data_write 同语义）
@@ -223,7 +250,7 @@ async def write_class_resource(
     }
 
 
-@router.post("/class/{class_id}/command/{command_type}")
+@router.post("/{class_id}/command/{command_type}")
 async def broadcast_to_class(
     class_id: str,
     command_type: str,

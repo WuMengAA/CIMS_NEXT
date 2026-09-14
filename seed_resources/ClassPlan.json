@@ -1,103 +1,14 @@
 {
-  "TimeLayoutId": "135ebafe-880b-4cd7-8163-daadd39c125d",
-  "TimeRule": {
-    "WeekDay": 4,
-    "WeekCountDiv": 0,
-    "WeekCountDivTotal": 2,
-    "IsActive": false
-  },
-  "Classes": [
-    {
-      "SubjectId": "9875b24c-470d-4195-8a6a-73925ea4808b",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
+  "Name": "未绑定班级",
+  "ClassPlans": {},
+  "ClassPlanGroups": {
+    "acaf4ef0-e261-4262-b941-34ea93cb4369": {
+      "Name": "默认",
+      "IsGlobal": false
     },
-    {
-      "SubjectId": "97d0bf3f-137f-4f8a-87d6-ff387063bbd3",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "3bbed0c0-bcf3-4dfe-a78d-5da9b02cf8bd",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "a4a76e77-29d8-4103-882c-2f4c9d1e8077",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "a41cc849-b4bc-4dfd-a464-7f4fa3e317ca",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "1154d452-5ede-4194-b4dd-cb40c956c8ed",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "1154d452-5ede-4194-b4dd-cb40c956c8ed",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "0ed2307b-4d9b-48fa-97ed-94bd2213c84e",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "2eab0fc6-33d2-4010-ab9a-a4456730891d",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "923f4a8b-51eb-468b-971d-bb02e7db0163",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "3bbed0c0-bcf3-4dfe-a78d-5da9b02cf8bd",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
-    },
-    {
-      "SubjectId": "a4a76e77-29d8-4103-882c-2f4c9d1e8077",
-      "IsChangedClass": false,
-      "IsEnabled": true,
-      "AttachedObjects": {},
-      "IsActive": false
+    "00000000-0000-0000-0000-000000000000": {
+      "Name": "全局课表群",
+      "IsGlobal": true
     }
-  ],
-  "Name": "周四",
-  "IsOverlay": false,
-  "OverlaySourceId": null,
-  "OverlaySetupTime": "2026-09-06T14:34:20.5435972+08:00",
-  "IsEnabled": true,
-  "AssociatedGroup": "15099917-eb37-4575-8a11-e3edf5ea8d73",
-  "AttachedObjects": {},
-  "IsActive": false
+  }
 }

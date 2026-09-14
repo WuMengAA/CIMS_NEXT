@@ -14,12 +14,72 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 
-from app.models.database import get_db, ClientProfile, ClassResourceSet
+from app.models.database import (
+    get_db,
+    ClientProfile,
+    ClassResourceSet,
+    CPFile,
+    TLFile,
+    SubFile,
+    SettingsFile,
+    PolicyFile,
+    ComponentsFile,
+    CredentialsFile,
+)
 from app.api.schemas.client import ClientManifest
 from app.core.client_ip import get_client_ip_from_request
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# 资源键 → (模型, 该类型的兜底资源名)，与 rebuild_min_tenant 的默认命名一致
+RESOURCE_MODEL = {
+    "class_plan": (CPFile, "default_classplan"),
+    "time_layout": (TLFile, "default_timelayout"),
+    "subjects": (SubFile, "default"),
+    "default_settings": (SettingsFile, "default"),
+    "policy": (PolicyFile, "default"),
+    "components": (ComponentsFile, "default"),
+    "credentials": (CredentialsFile, "default"),
+}
+
+
+async def _resolve_existing_name(
+    db: AsyncSession, key: str, wanted: str | None
+) -> str | None:
+    """把资源名收敛到一个**真实存在**的行，杜绝 manifest 指向悬空资源。
+
+    为什么必须做（工程铁律）：客户端拿到 manifest 后必然逐个资源去 GET，
+    而 `/get` 对不存在的 name 返回 404，`CCProtectMiddleware` 判定 ≥400——
+    同一 IP 60s 内累计 5 次即封禁 60s，会把该设备的命令轮询一起拖死。
+    「同步请求不存在的资源」是这套系统里最容易自伤的一条路径。
+
+    收敛顺序：请求名 → 该类型默认名 → 表内最近更新的一行 → None（表里真的什么都没有）。
+    """
+    model, default_name = RESOURCE_MODEL[key]
+    for candidate in (wanted, default_name):
+        if not candidate:
+            continue
+        row = (
+            await db.execute(select(model.name).where(model.name == candidate))
+        ).scalar_one_or_none()
+        if row:
+            return row
+    row = (
+        await db.execute(
+            select(model.name).order_by(model.updated_at.desc(), model.name).limit(1)
+        )
+    ).scalar_one_or_none()
+    if row:
+        logger.warning(
+            "[manifest] 资源 %s 的引用 '%s' 与默认名均不存在，回退到表内最近资源 '%s'",
+            key,
+            wanted,
+            row,
+        )
+    else:
+        logger.warning("[manifest] 资源表 %s 为空，无法为 %s 解析出可用资源", key, key)
+    return row
 
 
 async def resolve_resource_names(db: AsyncSession, client_uid: str):
@@ -76,6 +136,12 @@ async def resolve_resource_names(db: AsyncSession, client_uid: str):
                     v = getattr(cres, col, None)
                     if v:
                         names[k] = v
+
+    # 存在性收敛：绝不让 manifest 指向不存在的资源（404 → CCProtect 封 IP 的死循环）
+    for k in list(names.keys()):
+        resolved = await _resolve_existing_name(db, k, names[k])
+        if resolved:
+            names[k] = resolved
 
     return names
 

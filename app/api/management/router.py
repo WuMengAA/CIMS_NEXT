@@ -19,6 +19,7 @@ from .user_info_email import router as email_r
 from .user_info_username import router as uname_r
 from .user_password import router as pwd_r
 from .class_routes import router as class_r
+from .class_import_routes import router as class_import_r
 
 router = APIRouter()
 
@@ -45,3 +46,5 @@ router.include_router(pwd_r, prefix="/user/info/password", tags=["UserInfo"])
 
 # /class/*（Phase 1 班级层）
 router.include_router(class_r, prefix="/class", tags=["Class"])
+# /class/*（手动添加课表 + 从官方档案导入；与上面同前缀，仅关注点不同）
+router.include_router(class_import_r, prefix="/class", tags=["Class"])

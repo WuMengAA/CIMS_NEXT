@@ -161,13 +161,21 @@ ALTER TABLE command_queue ADD COLUMN ack_at TIMESTAMPTZ;
 
 ### 4.1 管理端（下行编排，8097）
 
+> 路径即为**真实路径**（management app 监听 8097，路由直接挂在 `/class/*`）。
+> 注意：`class_routes.py` 早期把 `class/` 写进了子路由，实际变成 `/class/class/create`，
+> 已修正为下表。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/v1/management/class/create` | 建班级 + 默认资源集 |
-| POST | `/api/v1/management/class/{class_id}/resource/write` | 写班级课表（复用 data_write 语义，带 version 乐观锁） |
-| GET | `/api/v1/management/class/list` | 班级列表（含设备数、资源版本） |
-| POST | `/api/v1/management/class/{class_id}/device/assign` | 手动把设备划入班级 |
-| POST | `/api/v1/management/command/send` | 向班级广播命令（下发到班级全部设备） |
+| POST | `/class/create` | 建班级 + 默认资源集 |
+| GET | `/class/list` | 班级列表（含设备数、资源版本） |
+| POST | `/class/device/assign` | 把设备划入班级 |
+| POST | `/class/device/unassign` | 把设备移出班级（回退设备级） |
+| POST/PUT | `/class/{class_id}/resource/{resource_type}/write` | 写班级某类资源（带 version 乐观锁 + 引用完整性校验） |
+| POST | `/class/{class_id}/command/{command_type}` | 向班级全部设备广播命令 |
+| POST | `/class/{class_id}/apply-week-template` | **手动添加**：给班级铺一张空周课表（6 天骨架） |
+| GET | `/class/{class_id}/schedule` | 读回某班课表（按星期汇总科目名） |
+| POST | `/class/import-from-profile` | **导入**：从 ClassIsland 官方档案一次切出 N 个班 |
 
 命令广播落库逻辑：`target_class` 展开为设备列表 → 逐设备写 `command_queue`（`command_type` 保持官方 `CommandTypes` 枚举）。
 
@@ -175,10 +183,17 @@ ALTER TABLE command_queue ADD COLUMN ack_at TIMESTAMPTZ;
 
 | 方法 | 路径 | 现状 | v2 变更 |
 |---|---|---|---|
-| GET | `/api/v1/client/{uid}/manifest` | ✅ | 解析优先级加入班级资源集 |
+| GET | `/api/v1/client/{uid}/manifest` | ✅ | 解析优先级加入班级资源集；**资源存在性兜底**（见下） |
 | GET | `/api/v1/client/{ResourceType}?name=` → 302 `/get?token=` | ✅ | 不变 |
 | GET | `/api/v1/client/{id}/command/queued` | ✅ | 语义改为 delivered（见 3.6） |
-| POST | `/api/v1/client/{id}/command/ack` | ❌ | **新增**：执行确认 |
+| POST | `/api/v1/client/{id}/command/ack` | ✅ | 执行确认 |
+
+**资源存在性兜底（必须保留）**：`_build_manifest` 之前会把 `class_resource_sets` 里的名字
+原样交给客户端。若该资源名在 `*_files` 表里不存在，客户端必然吃到 `/get` 的 404，
+而 `CCProtectMiddleware` 计数 ≥400 响应——**同一 IP 60s 内累计 5 次就封禁 60s**，
+连命令轮询一起打死（表现为插件「取不到命令 + 全接口 429」）。
+现在 `resolve_resource_names` 末尾统一收敛：**请求名 → 该类型默认名 → 表内最近更新的一行**，
+保证 manifest 永不指向不存在的资源。
 
 ### 4.3 上行回传（设备 → 服务端）
 
@@ -198,23 +213,50 @@ ALTER TABLE command_queue ADD COLUMN ack_at TIMESTAMPTZ;
 
 ## 5. 课表模型与编辑
 
-### 5.1 三件套标准（已对齐官方，无需改）
+### 5.1 三件套标准（官方格式是**唯一**基线）
 
-| 资源 | 官方模型 | 关键结构 |
+| 资源 | 官方消费方式 | 载荷形状（**必须是 Profile 信封**） |
 |---|---|---|
-| ClassPlan | `ClassPlan.json` | `TimeLayoutId` + `Classes[]`（按 SubjectId 引用课时）+ `TimeRule`/`AssociatedGroup`/`IsOverlay` |
-| TimeLayout | `TimeLayout.json` | `Layouts[]`：`StartTime`/`EndTime`/`TimeType`(0=上课,1=课间,3=动作组)/`DefaultClassId`/`BreakName` |
-| Subjects | `Subjects.json` | 科目名 ↔ 颜色词典 |
+| ClassPlan | `GetJsonAsync<Profile>` → `MergeDictionary(ClassPlans, …)` | `{"ClassPlans": {"<guid>": {...}}, "ClassPlanGroups": {"<guid>": {...}}}` |
+| TimeLayout | `GetJsonAsync<Profile>` → `MergeDictionary(TimeLayouts, …)` | `{"TimeLayouts": {"<guid>": {...}}}` |
+| Subjects | `GetJsonAsync<Profile>` → `MergeDictionary(Subjects, …)` | `{"Subjects": {"<guid>": {...}}}` |
 
-**不可拆分**：ClassPlan 的 `TimeLayoutId` 必须指向存在的 TimeLayout，`Classes[].SubjectId` 必须在 Subjects 词典中。编辑接口必须做**引用完整性校验**（新增 `validate_payload` 扩展点）。
+**这是踩过的坑，务必守住**：官方 `ClassIsland/Services/ProfileService.cs#MergeManagementProfileAsync`
+把三类资源都反序列化成 `Profile`（档案）再合并字典。若服务端返回**单个** ClassPlan
+或**单个** TimeLayout（早期 CIMS 种子的做法），客户端解析出的 `ClassPlans` 是空字典 →
+「资源 200 拿到了、课表一节课都不显示」，属于**静默失效**，比 404 难查得多。
+
+单份 ClassPlan 内部结构：`TimeLayoutId` + `Classes[]`（按 `SubjectId` 引用课时）+
+`TimeRule`（`WeekDay` 0=周日…5=周五）+ `AssociatedGroup` + `IsOverlay`。
+TimeLayout：`Layouts[]` = `StartTime`/`EndTime`/`TimeType`(0=上课,1=课间,2=动作组,3=动作组)/
+`DefaultClassId`/`BreakName`。Subjects：`{GUID: {Name, Initial, TeacherName, IsOutDoor}}`
+（**字典，不是数组**——旧校验按数组读会读空）。
+
+**两条官方硬约束（决定「按班级下发」怎么做）**：
+
+1. `ClassPlan.AssociatedGroup` 必须落在**默认课表群**（`ACAF4EF0-E261-4262-B941-34EA93CB4369`）
+   或**全局课表群**（`00000000-…-000000000000`）才会被
+   `LessonsService.CheckClassPlan` / `GetClassPlanByDate` 选中。
+   `Profile.SelectedClassPlanGroupId` **只存在本地档案里，集控通道下发不了**
+   （合并时只拷 `ClassPlans` / `ClassPlanGroups`）。所以按班级下发时必须把该班课表的
+   `AssociatedGroup` 改写到默认群——每台设备一份档案、档案里只有自己班的 6 天课表，
+   默认群即唯一有效群，语义自洽。
+2. 时间表与科目**全校共享一份**即可：12 个班的 ClassPlan 都指向
+   `tl_school` / `sub_school`，不必每班一份。
+
+**不可拆分**：ClassPlan 的 `TimeLayoutId` 必须存在于该校作息资源，`Classes[].SubjectId`
+必须在科目词典中（`SubjectId=Guid.Empty` 是官方「未填」合法写法，跳过）。
+写班级课表时强制走 `app/api/command/timetable_validator.py` 做引用完整性校验。
 
 ### 5.2 编辑器方案（三选一，按工作量递增）
 
 | 方案 | 说明 | 建议 |
 |---|---|---|
-| A. 表单生成三件套 | 管理端表单（课表网格：列=星期，行=节次）→ 生成 ClassPlan/TimeLayout/Subjects JSON → data_write | **先落地（够用）** |
-| B. 官方客户端导出导入 | 教师在 ClassIsland 桌面端编辑 → 导出 JSON → 上传为班级课表 | 低成本补充 |
+| A. 表单生成三件套 | 管理端表单（课表网格：列=星期，行=节次）→ 生成 ClassPlan/TimeLayout/Subjects JSON → data_write | 先落地（够用） |
+| B. 官方客户端导出导入 | 教师在 ClassIsland 桌面端编好课表 → 导出档案 JSON → **`POST /class/import-from-profile`** 一键切成 N 个班 | ✅ **已落地**（2026-09-14） |
 | C. 网页可视化课表编辑器 | 拖拽式课表编辑组件（工作量大） | 后置 |
+
+
 
 ### 5.3 推送链（下行）
 
@@ -232,6 +274,41 @@ ALTER TABLE command_queue ADD COLUMN ack_at TIMESTAMPTZ;
       policy.allowClientEdit=true  → 直接写回班级资源集（版本+1，广播全班）
       policy.allowClientEdit=false → 落 config_uploads 待审，管理端审批后生效
 ```
+
+---
+
+### 5.5 官方档案导入与手动添加（✅ 已落地 2026-09-14）
+
+**做法 B（导入真实档案）——批量把「一校十二班」搬进来**
+
+```
+Profiles/Default.json（官方档案）
+  → parse_official_profile()      按 ClassPlan.AssociatedGroup 切出「一个班 = 一个课表群 = 6 天」
+  → plan_class_imports()          生成 cp_class01…cp_class12 + class_01…class_12
+  → validate_import()             自检：星期覆盖 / 作息引用 / 科目引用
+  → write_shared_resources()      全校共享 tl_school（作息）+ sub_school（科目）
+  → create_class_records()        每班写 cp_classNN（信封）+ classes + class_resource_sets
+```
+
+- 命令行：`scripts/import_classes_from_profile.py --reset --assign lab-pc-001=1`
+- 接口：`POST /class/import-from-profile`（body 传档案 JSON，`classes="1,3,8"` 可只导部分班）
+- 实现落在 `app/services/schedule_importer.py`（CLI 与 API 共用同一套编排，避免两份逻辑漂移）
+
+**做法 A（手动添加）——没有档案也能起课表**
+
+```
+POST /class/create                     建班（自动绑默认资源集）
+POST /class/{class_id}/apply-week-template   铺空周课表：6 天骨架 + 按作息算好的节数
+POST /class/{class_id}/resource/ClassPlan/write   逐天写课时（引用完整性校验）
+GET  /class/{class_id}/schedule        读回核对（按星期汇总科目名）
+```
+
+`apply-week-template` 的默认「哪天用哪份作息」是**按作息名里的「周X」提示推断**的
+（`周1234` → 周一~周四、`周5` → 周五、`周日` → 周日），推断不到再按课时数兜底。
+不要按 `TimeLayouts` 字典的插入序或字典序取作息——档案里那个字典是**乱序**的。
+
+**未绑定班级的设备**：`default_classplan` 被写成「合法空信封」（只有两个课表群、无课表），
+配合 §4.2 的资源存在性兜底，既不误发别班课表，也不会因 404 触发 CCProtect 自封 IP。
 
 ---
 
@@ -309,7 +386,22 @@ ALTER TABLE command_queue ADD COLUMN ack_at TIMESTAMPTZ;
 - **说明**：`ConfigUploadScReq`/`AuditScReq` servicer 实测后端早已实现（`config_upload.py`/`audit.py`），非「未实现」；本 Phase 落地的是 ack 语义 + 插件自动确认
 - **验证**：kill 客户端 → 注入命令 → 重连后补发执行；实时闭环 inject→poller process→ack 200→DB done 探针通过
 
-### Phase 4 · 控制矩阵与运维完善（建议 0.5 周）
+### Phase 4 · 真实课表导入与官方格式兼容（✅ 已实施 2026-09-14）
+
+- **目标**：清掉测试班级/资源，把 12 个班的真实课表按**官方格式**落库；同时给出「手动添加课表」能力
+- **改动**：
+  - `app/services/schedule_importer.py`：官方档案解析（切班）+ Profile 信封构造 + 导入自检 + 落库编排
+  - `scripts/import_classes_from_profile.py`：CLI 导入（`--reset` 清空 + `--assign` 分派设备）
+  - `POST /class/import-from-profile`、`POST /class/{id}/apply-week-template`、`GET /class/{id}/schedule`
+  - **修正三类资源载荷为官方 Profile 信封**（ClassPlan/TimeLayout/Subjects）——此前是裸对象，客户端会静默不显示
+  - `manifest.py` 资源存在性兜底；`timetable_validator.py` 适配 Subjects 字典格式 + 信封/裸对象双读
+  - 资源模型补 `server_default`（裸 SQL 插入不再撞 NOT NULL）+ `scripts/migrate_notnull_defaults.py` 回填老 Schema
+  - 修正 `class_routes.py` 路由重复前缀（`/class/class/*` → `/class/*`）
+- **验证**：12 班 manifest 各自解析到 `cp_classNN`；资源内容断言为官方信封且课表全落在默认课表群；
+  12 班周一课表逐班核对；悬空引用演练（`cp_不存在` → 自动兜底 `default_classplan` 且 200）；
+  手动添加空周课表 = 6 天骨架且节数与作息一致；旁路租户 `rebuild_min_tenant` 全流程（12 班 + 7 类资源 + DataUpdated）通过
+
+### Phase 5 · 控制矩阵与运维完善（建议 0.5 周）
 
 - **目标**：控制矩阵补全，生产可运维
 - **改动**：`power_off` / `volume_set` / `media_*` 命令落地；审计事件 servicer + 管理端状态面板；截图回传

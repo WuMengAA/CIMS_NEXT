@@ -10,7 +10,7 @@
 """
 
 from datetime import datetime
-from sqlalchemy import DateTime, Integer, String, text
+from sqlalchemy import DateTime, Integer, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
@@ -23,16 +23,17 @@ class Class(Base):
     # 人可读主键，如 'class_3p1'
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     # 班级名，如 '初三1班'
-    name: Mapped[str] = mapped_column(String(128), default="")
+    name: Mapped[str] = mapped_column(String(128), default="", server_default=text("''"))
     # 绑定班级资源集
-    resource_set_id: Mapped[str] = mapped_column(String(64), default="")
+    resource_set_id: Mapped[str] = mapped_column(String(64), default="", server_default=text("''"))
     # 排序权重
-    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow
+        DateTime(timezone=True), default=datetime.utcnow, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow,
+        server_default=func.now()
     )
 
 
@@ -54,5 +55,6 @@ class ClassResourceSet(Base):
     credentials: Mapped[str] = mapped_column(String, default="default", nullable=True,
                                              server_default=text("'default'"))
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow,
+        server_default=func.now()
     )

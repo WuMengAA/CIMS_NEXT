@@ -11,6 +11,8 @@ Components/Credentials）真实落库，使客户端 manifest→资源 拉取链
   · 资源内容取自 seed_resources/（由 extract_seed_resources.py 从真实 ClassIsland
     安装提取），按官方资源类型写入对应资源表
   · 客户端在 clients + client_profiles 双表登记，manifest 依此解析各资源 name
+  · 从 ClassIsland 官方档案切出 N 个班级，每班一份 cp_classNN（官方 Profile 信封），
+    全校共享 tl_school / sub_school，CLIENT_UID 默认划入 1 班
   · 预置一条 DataUpdated 待执行命令，供插件 HTTP 轮询取走闭环验证
 
 幂等：重复执行会先删除既有 demo-class 租户再重建，可安全重跑。
@@ -32,10 +34,14 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # slug 与 owner —— 与插件 stelarith-sync.json 目标一致
-SLUG = "demo-class"
+# 可用环境变量 CIMS_TENANT_SLUG 覆盖（便于在旁路 slug 上验证初始化流程）
+SLUG = os.environ.get("CIMS_TENANT_SLUG", "demo-class")
 ACCOUNT_NAME = "星璃演示班"
 OWNER_USER_ID = "e3dcfd9e-d5d0-46c1-a015-b72ebd750449"  # 系统保留管理员 WuMengAA
 CLIENT_UID = "lab-pc-001"
+
+# 班级课表来源：ClassIsland 官方档案（可用环境变量 CIMS_CLASS_PROFILE 覆盖）
+DEFAULT_CLASS_PROFILE = r"D:\Classlsland\data\Profiles\Default.json"
 
 # 官方 7 类资源：种子文件 -> (租户表, 资源 name)
 # name 与 manifest.py 的默认值对齐（cp/tl 为 default_classplan/default_timelayout，其余 default）
@@ -73,12 +79,21 @@ async def main() -> None:
         print(f"[ok] 租户 schema: {schema}")
 
         # ---- 3) 写入官方 7 类资源 ----
+        # 关键：search_path 只在进入租户数据阶段时设置一次，且**不再切回 public**。
+        # 若中途切回 public，会话里残留的脏 ORM 对象会在 commit 时才 flush，
+        # 那时会打到 public 下的同名旧表（列不同 → 报「字段不存在」）。
+        await db.execute(text(f'SET search_path TO "{schema_name}"'))
         written = await _seed_resources(db, schema_name)
         print(f"[ok] 官方资源写入: {written} 类")
 
         # ---- 4) 登记客户端设备（clients）+ 资源档案（client_profiles）----
         await _register_client(db, schema_name)
         print(f"[ok] 客户端登记: {CLIENT_UID}（clients + client_profiles）")
+
+        # ---- 4.5) 从 ClassIsland 官方档案导入班级真实课表 ----
+        # 每个班一份 cp_classNN（官方 Profile 信封），全校共享 tl_school / sub_school；
+        # 并把 CLIENT_UID 划入 1 班，便于直接验证按班级下发。
+        await _import_classes(db, schema_name)
 
         # ---- 5) 预置一条 DataUpdated 待执行命令（验证插件轮询取走闭环）----
         await _enqueue_data_updated(db, schema_name)
@@ -105,7 +120,6 @@ async def _seed_resources(db: AsyncSession, schema_name: str) -> int:
     """把 seed_resources/ 下的官方资源写入租户 schema 的资源表。"""
     count = 0
     async with db.begin_nested():
-        await db.execute(text(f'SET search_path TO "{schema_name}"'))
         for fname, table, res_name in RESOURCE_MAP:
             path = os.path.join(SEED_DIR, fname)
             if not os.path.exists(path):
@@ -134,7 +148,6 @@ async def _seed_resources(db: AsyncSession, schema_name: str) -> int:
 async def _register_client(db: AsyncSession, schema_name: str) -> None:
     """登记物理设备与资源档案（manifest 依 client_profiles 解析各资源 name）。"""
     async with db.begin_nested():
-        await db.execute(text(f'SET search_path TO "{schema_name}"'))
         await db.execute(
             text(
                 """
@@ -150,9 +163,9 @@ async def _register_client(db: AsyncSession, schema_name: str) -> None:
             text(
                 """
                 INSERT INTO client_profiles
-                    (client_id, class_plan, time_layout, subjects,
+                    (client_id, class_id, class_plan, time_layout, subjects,
                      default_settings, policy, components, credentials, updated_at)
-                VALUES (:cid, 'default_classplan', 'default_timelayout', 'default',
+                VALUES (:cid, '', 'default_classplan', 'default_timelayout', 'default',
                         'default', 'default', 'default', 'default', now())
                 ON CONFLICT (client_id) DO UPDATE
                     SET class_plan = EXCLUDED.class_plan,
@@ -167,23 +180,63 @@ async def _register_client(db: AsyncSession, schema_name: str) -> None:
             ),
             {"cid": CLIENT_UID},
         )
-        await db.execute(text("SET search_path TO public"))
+
+
+async def _import_classes(db: AsyncSession, schema_name: str) -> None:
+    """从 ClassIsland 官方档案切出 N 个班级，写入班级课表资源并分派设备。
+
+    档案路径可用环境变量 CIMS_CLASS_PROFILE 覆盖；缺失则跳过（不阻断租户初始化）。
+    """
+    from app.services.schedule_importer import (
+        assign_device_to_class,
+        create_class_records,
+        parse_official_profile,
+        plan_class_imports,
+        validate_import,
+        write_shared_resources,
+    )
+
+    profile_path = os.environ.get("CIMS_CLASS_PROFILE", DEFAULT_CLASS_PROFILE)
+    if not os.path.exists(profile_path):
+        print(f"[warn] 未找到班级档案 {profile_path}，跳过班级导入")
+        return
+
+    import io
+
+    with io.open(profile_path, encoding="utf-8-sig") as f:
+        profile = json.load(f)
+
+    parsed = parse_official_profile(profile)
+    imports = plan_class_imports(parsed)
+    issues = validate_import(parsed, imports)
+    if issues:
+        raise RuntimeError("班级课表自检未通过：\n  - " + "\n  - ".join(issues))
+
+    async with db.begin_nested():
+        await write_shared_resources(db, parsed)
+        for imp in imports:
+            await create_class_records(db, imp)
+        await assign_device_to_class(db, CLIENT_UID, 1)
+
+    print(
+        f"[ok] 班级课表导入: {len(imports)} 个班（每班一份 {imports[0].class_plan_name} 风格资源）"
+        f"，全校共享 tl_school / sub_school，{CLIENT_UID} → 1班"
+    )
 
 
 async def _enqueue_data_updated(db: AsyncSession, schema_name: str) -> None:
     """预置一条 DataUpdated pending 命令，供插件轮询取走验证闭环。"""
     async with db.begin_nested():
-        await db.execute(text(f'SET search_path TO "{schema_name}"'))
         await db.execute(
             text(
                 """
-                INSERT INTO command_queue (client_id, command_type, payload, status, created_at)
-                VALUES (:cid, 'DataUpdated', '', 'pending', now())
+                INSERT INTO command_queue
+                    (client_id, command_type, payload, status, ack_status, created_at)
+                VALUES (:cid, 'DataUpdated', '', 'pending', 'pending', now())
                 """
             ),
             {"cid": CLIENT_UID},
         )
-        await db.execute(text("SET search_path TO public"))
 
 
 async def _verify(_db: AsyncSession, schema_name: str) -> None:
@@ -191,7 +244,6 @@ async def _verify(_db: AsyncSession, schema_name: str) -> None:
     from app.models.engine import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
-        await db.execute(text(f'SET search_path TO "{schema_name}"'))
         for _, table, res_name in RESOURCE_MAP:
             r = await db.execute(
                 text(f"SELECT count(*), coalesce(max(length(content)),0) FROM {table} WHERE name = :n"),
@@ -201,6 +253,21 @@ async def _verify(_db: AsyncSession, schema_name: str) -> None:
             print(f"[info] {table:<18} name={res_name:<20} rows={n} content={size}B")
         r = await db.execute(text("SELECT client_id FROM client_profiles"))
         print(f"[info] client_profiles: {[x[0] for x in r.fetchall()]}")
+        r = await db.execute(
+            text(
+                "SELECT c.id, c.name, s.class_plan, "
+                "(SELECT count(*) FROM client_profiles p WHERE p.class_id = c.id) "
+                "FROM classes c LEFT JOIN class_resource_sets s ON s.resource_set_id = c.resource_set_id "
+                "ORDER BY c.sort_order, c.id"
+            )
+        )
+        rows = r.fetchall()
+        print(f"[info] classes: {len(rows)} 个")
+        for row in rows:
+            print(f"[info]   班级 {row[0]} {row[1]} -> {row[2]}（设备 {row[3]}）")
+        r = await db.execute(text("SELECT client_id, class_id FROM client_profiles ORDER BY 1"))
+        for cid, cid2 in r.fetchall():
+            print(f"[info]   设备 {cid} -> 班级 {cid2 or '(未绑定)'}")
         r = await db.execute(
             text(
                 "SELECT id, client_id, command_type, status "
@@ -213,7 +280,6 @@ async def _verify(_db: AsyncSession, schema_name: str) -> None:
                 f"[info] command id={m.get('id')} client={m.get('client_id')} "
                 f"type={m.get('command_type')} status={m.get('status')}"
             )
-        await db.execute(text("SET search_path TO public"))
 
 
 if __name__ == "__main__":
