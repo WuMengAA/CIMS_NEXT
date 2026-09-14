@@ -194,3 +194,8 @@ cims_server.key
 
 # CIMS 本地配置
 .cims/
+
+# 本地探测/临时产物（不入库）
+._tmp/
+backups/
+*.log
