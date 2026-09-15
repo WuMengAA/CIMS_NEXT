@@ -78,6 +78,26 @@ def class_id_of(index: int) -> str:
     return f"class_{index:02d}"
 
 
+# 班级课表群的 UUIDv5 命名空间（固定值，绝不能改——改了会让所有设备认不出既有群）
+CLASS_GROUP_NAMESPACE = "6f2d8a41-0c93-4b7e-9d15-8a3c5e7f0b26"
+
+
+def deterministic_group_guid(index: int) -> str:
+    """由班号确定性地派生课表群 GUID（同一班永远得同一个群）。
+
+    用 UUIDv5（基于名字的散列）而非 uuid4：重复导入同一个班时落在同一个群，
+    设备端表现为「更新这个群」，而不是每导一次就多出一个空群。
+    """
+    import uuid
+
+    return str(uuid.uuid5(uuid.UUID(CLASS_GROUP_NAMESPACE), f"stelarith-class-group-{index}"))
+
+
+def class_group_name(index: int, label: str | None = None) -> str:
+    """第 index 个班的课表群显示名（与 build_class_plan_resource 里写的保持一致）。"""
+    return f"{label or default_class_label(index)}课表群"
+
+
 def default_class_label(index: int) -> str:
     """第 index 个班的默认班名（1 基）。官方档案里 12 个群同名「新课表群」，无从区分，
     故按档案中的出现次序编号；导入后可在面板改名。"""
@@ -259,15 +279,25 @@ def parse_official_profile(profile: dict) -> ProfileParseResult:
 
 
 def build_class_plan_resource(
-    block: ClassBlock, label: str | None = None, group_guid: str = DEFAULT_GROUP_GUID
+    block: ClassBlock, label: str | None = None, group_guid: str | None = None
 ) -> dict:
     """把一个班的 6 天课表打成一份 ClassPlan 资源（Profile 信封）。
 
     - 保留原始 plan GUID（同 GUID 在设备端是「更新」而非「新增」，不会堆出重复课表）
-    - AssociatedGroup 改写为默认群，保证官方客户端会激活它
-      （集控通道下发不了 SelectedClassPlanGroupId，详见模块 docstring）
+    - **每个班使用自己的独立课表群**（`group_guid`，缺省由班号稳定派生）：
+      集控通道下发不了 `SelectedClassPlanGroupId`（合并时只拷 ClassPlans/ClassPlanGroups），
+      所以设备端一次性会累积到所有班的课表。若各班的课表都塞进「默认群」，
+      同一天会有 12 张课表互相覆盖，"这台机器显示哪一班"就无从控制。
+      改为每班一群后，由插件按集控指令把 `SelectedClassPlanGroupId` 指向对应群
+      （见 `set_active_class` 动作 / `POST /class/{id}/activate`），切班语义才成立。
+
+      `group_guid` 缺省用「班号确定性地哈希成 GUID」，保证同一班多次导入落在同一群，
+      不会因为重新导入而堆出新群。
     """
     label = label or default_class_label(block.index)
+    group_guid = (group_guid or deterministic_group_guid(block.index)).lower()
+    group_name = f"{label}课表群"
+
     plans: dict[str, dict] = {}
     for weekday in block.weekdays:
         guid, plan = block.plans[weekday]
@@ -283,9 +313,14 @@ def build_class_plan_resource(
         "Name": f"{label}课表",
         "ClassPlans": plans,
         "ClassPlanGroups": {
+            group_guid: {"Name": group_name, "IsGlobal": False},
+            # 默认群 / 全局群一并带上：官方客户端在合并 ClassPlanGroups 时按 GUID 逐键并，
+            # 带上它们可保证设备端始终存在这两个「永远有效」的群，避免用户手工切走后再无回退群。
             DEFAULT_GROUP_GUID: {"Name": DEFAULT_GROUP_NAME, "IsGlobal": False},
             GLOBAL_GROUP_GUID: {"Name": GLOBAL_GROUP_NAME, "IsGlobal": True},
         },
+        # 非官方字段，仅供 CIMS 侧读取「本班课表群是哪个」，客户端会忽略它。
+        "StelarithActiveGroup": group_guid,
     }
 
 
@@ -304,14 +339,21 @@ def build_empty_week_class_plan_resource(
     layout_by_weekday: dict[int, str],
     plan_guids: dict[int, str] | None = None,
     layout_classes: dict[str, int] | None = None,
+    group_guid: str | None = None,
 ) -> dict:
     """手工新建一个班的「空周课表」资源（6 天骨架，课时留空待填）。
 
     用于面板「手动添加课表」：不依赖任何档案导入，只要给出每天的作息 GUID 即可。
     Classes 里 SubjectId 留 Guid.Empty——官方 `ClassPlan.RefreshClassesList()` 会用
     作息时间点的 `DefaultClassId` 兜底填充，是官方推荐的空课表形态。
+
+    `group_guid`：本班课表群。缺省时用「由 label 确定性派生」的群，保证手工新建的班
+    与导入的班一样有独立课表群，可被 `POST /class/{id}/activate` 切到。
     """
     import uuid
+
+    group_guid = (group_guid or deterministic_group_guid(_label_to_index(label))).lower()
+    group_name = f"{label}课表群"
 
     plans: dict[str, dict] = {}
     for weekday, tl_id in sorted(layout_by_weekday.items()):
@@ -339,7 +381,7 @@ def build_empty_week_class_plan_resource(
             "IsOverlay": False,
             "OverlaySourceId": None,
             "IsEnabled": True,
-            "AssociatedGroup": DEFAULT_GROUP_GUID,
+            "AssociatedGroup": group_guid,
             "AttachedObjects": {},
             "IsActive": False,
         }
@@ -347,10 +389,39 @@ def build_empty_week_class_plan_resource(
         "Name": f"{label}课表",
         "ClassPlans": plans,
         "ClassPlanGroups": {
+            group_guid: {"Name": group_name, "IsGlobal": False},
             DEFAULT_GROUP_GUID: {"Name": DEFAULT_GROUP_NAME, "IsGlobal": False},
             GLOBAL_GROUP_GUID: {"Name": GLOBAL_GROUP_NAME, "IsGlobal": True},
         },
+        "StelarithActiveGroup": group_guid,
     }
+
+
+# 中文数字 → 阿拉伯数字（用于从「3班」这类标签反推班号；也接受「初三1班」）
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def _label_to_index(label: str) -> int:
+    """从班级标签里抽出班号；抽不到时用字符串的稳定散列映射到一个正整数。
+
+    目的只是让「同一个标签永远得到同一个群」，不参与任何业务判断，
+    所以抽不到班号时退化为散列完全可接受（不会与其它班冲突到同一群的概率极高）。
+    """
+    if label:
+        m = re.search(r"(\d+)", label)
+        if m:
+            return int(m.group(1))
+        # 「三班」这种中文数字写法
+        for ch, val in _CN_DIGITS.items():
+            if ch in label:
+                return val
+        # 纯散列兜底（保证稳定）
+        h = 0
+        for ch in label:
+            h = (h * 131 + ord(ch)) & 0x7FFFFFFF
+        return h % 100000 + 1000
+    return 0
 
 
 @dataclass

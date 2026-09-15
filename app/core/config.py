@@ -52,6 +52,9 @@ class CIMSSettings(BaseSettings):
     # 跨系统账号同步密钥（website 为账号权威时，website 调 CIMS /user/sync-create 建镜像账号用）
     cims_sync_key: str = ""
 
+    # 同步账号默认归属的 Account 空间 slug（对应 tenant_<slug> 租户）
+    cims_default_account_slug: str = "demo-class"
+
 
 _settings = CIMSSettings()
 
@@ -96,6 +99,11 @@ KEY_FILE: str = _settings.cims_key_file
 
 # 跨系统账号同步密钥（空字符串表示禁用同步接口）
 SYNC_KEY: str = _settings.cims_sync_key
+
+# 同步账号默认归属的 Account 空间 slug（留空则退化为「库中最早的 active Account」）
+# 用途：website 镜像过来的账号必须挂在某个 Account 上，否则 GET /account/list 为空，
+# 网站侧的设备广播/控制端点找不到 account，整条链路哑火。
+DEFAULT_ACCOUNT_SLUG: str = _settings.cims_default_account_slug
 
 
 def validate_config() -> None:
