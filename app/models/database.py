@@ -23,7 +23,7 @@ from .resource_files import (
     ComponentsFile,
     CredentialsFile,
 )
-from .client import ClientRecord, ClientProfile
+from .client import ClientRecord, ClientProfile, ClientStatus
 from .class_model import Class, ClassResourceSet
 from .command_queue import CommandQueueRecord
 from .audit import AuditLog
@@ -52,6 +52,7 @@ __all__ = [
     "CredentialsFile",
     "ClientRecord",
     "ClientProfile",
+    "ClientStatus",
     "Class",
     "ClassResourceSet",
     "CommandQueueRecord",

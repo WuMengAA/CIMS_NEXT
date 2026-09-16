@@ -8,6 +8,7 @@ from .manifest import router as manifest_router
 from .resource import router as resource_router
 from .command_poll import router as command_poll_router
 from .messages import router as messages_router
+from .status import router as status_router
 
 router = APIRouter()
 
@@ -16,3 +17,5 @@ router.include_router(resource_router)
 router.include_router(command_poll_router)
 # 只读「消息中心」视图：教室端插件拉取最近广播/通知历史（不同于消费型 command/queued）
 router.include_router(messages_router)
+# 设备运行时状态上报/回读：面板「设备状态真实显示」的数据源
+router.include_router(status_router)

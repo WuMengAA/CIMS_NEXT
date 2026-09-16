@@ -5,7 +5,7 @@ Schema 隔离后不再需要 tenant_id 列。
 """
 
 from datetime import datetime
-from sqlalchemy import DateTime, String, text, func
+from sqlalchemy import DateTime, String, Text, text, func
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import Index
 from .base import Base
@@ -25,6 +25,55 @@ class ClientRecord(Base):
     mac: Mapped[str] = mapped_column(String, default="", server_default=text("''"))
     registered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ClientStatus(Base):
+    """教室端设备**运行时状态**上报（心跳）。
+
+    为什么单开一张表、而不是往 `client_profiles` 加列：
+      · `client_profiles` 是**配置**（这台机器该用哪套课表/组件），随管理端指令变化；
+      · 本表是**遥测**（这台机器现在活着吗、装了什么、模块开了哪些），由设备自己
+        高频覆盖写。两者生命周期与写入方完全不同，混在一起会让"配置变更时间"
+        被心跳踩掉。
+
+    「设备状态真实显示」的数据源就是它 —— 面板不再猜、不再用演示数据：
+      · `reported_at` 距离现在多久 → 在线 / 离线；
+      · `host` / `ip` / `version` → 是**哪台**机器、跑的哪个版本；
+      · `modules_json` → 星璃功能模块开关的真实值（面板开关的回读依据）；
+      · `plugins_json` → ClassIsland 插件清单（id/名称/版本/启用/加载状态）；
+      · `extra_json` → 同步快照规模、当前课表群、命令轮询计数等零散遥测。
+    """
+
+    __tablename__ = "client_status"
+
+    client_id: Mapped[str] = mapped_column(String, primary_key=True)
+    host: Mapped[str] = mapped_column(String, default="", server_default=text("''"))
+    ip: Mapped[str] = mapped_column(String, default="", server_default=text("''"))
+    version: Mapped[str] = mapped_column(String, default="", server_default=text("''"))
+    # 设备自报的所属班级（管理端 client_profiles.class_id 才是权威；
+    # 这里冗余一份用于交叉校验「设备认为自己属于哪个班」与「管理端指派是否一致」）
+    class_id: Mapped[str] = mapped_column(
+        String, default="", server_default=text("''"), index=True
+    )
+    # 当前激活的课表群（本地档案实际生效的那一个，远程切班后可回读验证）
+    active_class_group: Mapped[str] = mapped_column(
+        String, default="", server_default=text("''")
+    )
+    modules_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'"),
+        comment="星璃功能模块开关 JSON: {module_id: bool}"
+    )
+    plugins_json: Mapped[str] = mapped_column(
+        Text, default="[]", server_default=text("'[]'"),
+        comment="ClassIsland 插件清单 JSON: [{id,name,version,enabled,status,isStelarith}]"
+    )
+    extra_json: Mapped[str] = mapped_column(
+        Text, default="{}", server_default=text("'{}'")
+    )
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True,
+        comment="设备最近一次心跳时间；面板据此判定在线/离线"
     )
 
 

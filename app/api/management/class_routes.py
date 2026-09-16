@@ -113,6 +113,119 @@ async def create_class(
     }
 
 
+@router.get("/device-map")
+async def device_class_map(db: AsyncSession = Depends(get_db)):
+    """设备 ↔ 班级 映射（「一班一号、不共享」的权威视图）。
+
+    返回：
+      devices: {client_id: class_id}          未绑定班级的设备值为 ""（设备级独立配置）
+      classes: [{class_id, name, devices:[…]}] 按班级归组，便于面板直接渲染
+
+    为什么需要这个接口：
+      · `client_profiles.class_id` 是**单值字段**，一台设备只能属于一个班 ——
+        这正是「一班一号」的数据层保证；但此前没有任何接口把这个事实暴露出来，
+        面板看不到设备归属，广播也无法「按班级定向」。
+      · 广播定向的实现依赖它：把「目标班级名/号」解析成具体的设备 uid 集合，
+        否则只能全量广播（＝向全校推送，与定向语义不符）。
+    """
+    rows = (await db.execute(select(Class).order_by(Class.sort_order, Class.name))).scalars().all()
+    profs = (await db.execute(select(ClientProfile))).scalars().all()
+
+    by_class: dict[str, list[str]] = {c.id: [] for c in rows}
+    devices: dict[str, str] = {}
+    for p in profs:
+        devices[p.client_id] = p.class_id or ""
+        if p.class_id and p.class_id in by_class:
+            by_class[p.class_id].append(p.client_id)
+
+    return {
+        "devices": devices,
+        "classes": [
+            {"class_id": c.id, "name": c.name, "devices": sorted(by_class.get(c.id, []))}
+            for c in rows
+        ],
+    }
+
+
+@router.get("/device-status")
+async def device_status(db: AsyncSession = Depends(get_db)):
+    """设备**真实状态**总览（面板「设备控制 / 远程控制 / 插件管理」的唯一数据源）。
+
+    与 `/device-map` 的区别：
+      · `/device-map` 只回答「设备 ↔ 班级」这一个静态问题（用于广播定向解析）；
+      · 本接口叠加**心跳遥测**（client_status 表），回答「现在活着吗、是哪台机器、
+        什么版本、模块开了哪些、装了哪些插件」。面板不再需要拿配置时间冒充在线状态。
+
+    在线判定：`reported_at` 距今 ≤ FRESH_SECONDS（90s，约 3 个心跳周期）。
+    从未上报的设备 `online=false, reported=false` —— 与"曾经上线过但已离线"区分开，
+    前者说明设备还没接上集控（或端点不通），后者说明设备掉线。
+
+    未绑定班级的设备也会出现在 `devices` 里（`class_id=""`），否则管理端会"看不见"
+    这台机器，也就无法把它指派进班级。
+    """
+    from app.api.client.status import FRESH_SECONDS
+    from app.models.client import ClientStatus
+
+    now = datetime.now(timezone.utc)
+
+    classes = (await db.execute(select(Class).order_by(Class.sort_order, Class.name))).scalars().all()
+    class_names = {c.id: c.name for c in classes}
+
+    profs = (await db.execute(select(ClientProfile))).scalars().all()
+    statuses = {s.client_id: s for s in (await db.execute(select(ClientStatus))).scalars().all()}
+
+    def _load(raw: str | None, fallback):
+        try:
+            return json.loads(raw) if raw else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    devices: list[dict] = []
+    # 以 client_profiles 为主体（管理端认识的设备），再并入只上报过心跳的设备
+    all_ids = sorted({p.client_id for p in profs} | set(statuses.keys()))
+    profile_by_id = {p.client_id: p for p in profs}
+
+    for cid in all_ids:
+        prof = profile_by_id.get(cid)
+        st = statuses.get(cid)
+        age = None
+        if st is not None and st.reported_at is not None:
+            age = (now - st.reported_at).total_seconds()
+        devices.append(
+            {
+                "client_id": cid,
+                "class_id": (prof.class_id if prof else "") or "",
+                "class_name": class_names.get((prof.class_id if prof else "") or "", ""),
+                "online": age is not None and age <= FRESH_SECONDS,
+                "reported": st is not None,
+                "age_seconds": int(age) if age is not None else None,
+                "reported_at": st.reported_at.isoformat() if st and st.reported_at else None,
+                "host": st.host if st else "",
+                "ip": st.ip if st else "",
+                "version": st.version if st else "",
+                "active_class_group": st.active_class_group if st else "",
+                "modules": _load(st.modules_json if st else None, {}),
+                "plugins": _load(st.plugins_json if st else None, []),
+                "extra": _load(st.extra_json if st else None, {}),
+            }
+        )
+
+    return {
+        "fresh_seconds": FRESH_SECONDS,
+        "count": len(devices),
+        "online_count": sum(1 for d in devices if d["online"]),
+        "devices": devices,
+        "classes": [
+            {
+                "class_id": c.id,
+                "name": c.name,
+                "devices": sorted(p.client_id for p in profs if p.class_id == c.id),
+            }
+            for c in classes
+        ],
+    }
+
+
 @router.get("/list")
 async def list_classes(db: AsyncSession = Depends(get_db)):
     """列出全部班级（含设备数）。"""
@@ -141,9 +254,21 @@ async def list_classes(db: AsyncSession = Depends(get_db)):
 async def assign_device_to_class(
     class_id: str,
     client_id: str,
+    force: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
-    """把一台设备划入班级（client_profiles.class_id = class_id）。"""
+    """把一台设备划入班级（client_profiles.class_id = class_id）。
+
+    「一班一号、不共享」的两条硬约束：
+
+      1. **不共享**：`class_id` 是单值字段，赋值即转移 —— 一台设备在任一时刻
+         只属于一个班。这是数据层保证，不靠调用方自觉。
+      2. **不静默抢占**：设备已属于**另一个**班时，默认返回 409 而不是直接覆盖。
+         早期实现是无条件 `prof.class_id = class_id`，于是「给 2 班指派一台
+         原本属于 1 班的设备」会悄悄把 1 班的设备抢走 —— 1 班从此收不到自己的
+         广播/课表，且没有任何报错，是最难查的一类事故。
+         确实要转移时显式传 `force=true`（面板上表现为二次确认）。
+    """
     cls = (
         await db.execute(select(Class).where(Class.id == class_id))
     ).scalar_one_or_none()
@@ -155,9 +280,27 @@ async def assign_device_to_class(
     ).scalar_one_or_none()
     if not prof:
         raise HTTPException(404, f"设备 {client_id} 的配置档案不存在")
+
+    prev = prof.class_id or ""
+    if prev and prev != class_id and not force:
+        prev_name = (
+            await db.execute(select(Class.name).where(Class.id == prev))
+        ).scalar_one_or_none() or prev
+        raise HTTPException(
+            409,
+            f"设备 {client_id} 已属于「{prev_name}」（{prev}）。"
+            f"一台设备同一时间只能属于一个班；确需转移请显式确认（force=true）。",
+        )
+
     prof.class_id = class_id
     await db.commit()
-    return {"status": "success", "client_id": client_id, "class_id": class_id}
+    return {
+        "status": "success",
+        "client_id": client_id,
+        "class_id": class_id,
+        "previous_class_id": prev,
+        "transferred": bool(prev and prev != class_id),
+    }
 
 
 @router.post("/device/unassign")
