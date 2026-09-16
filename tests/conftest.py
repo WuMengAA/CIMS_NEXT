@@ -42,6 +42,28 @@ from app.core.redis import init_redis  # noqa: E402
 from app.models.database import init_db, AsyncSessionLocal, Account  # noqa: E402
 from app.models.database import ensure_tenant_schema  # noqa: E402
 from app.core.tenant import tenant_ctx, schema_ctx  # noqa: E402
+from app.core.security.state import (  # noqa: E402
+    get_ip_failures_dict,
+    get_global_requests,
+    set_cc_state,
+)
+
+
+def _reset_rate_limit_state():
+    """清空进程内的限流状态。
+
+    为什么每个测试都要做：限流中间件按「对端 IP」累计 60 秒窗口内的 ≥400 响应数，
+    阈值 5 次即封禁。测试全部共用同一个 TestClient，对端 IP 恒为 "testclient"，
+    而安全类测试**故意**制造大量 4xx —— 于是计数器一路涨到阈值，把 "testclient"
+    打进封禁。此后所有测试（包括完全无关的登录、manifest）一律收到 429，
+    表现为一整片「assert 429 == 200」的假失败，把真 bug 淹没掉。
+
+    注意这与生产行为无关：生产里每个客户端有自己的 IP，不会互相连坐。
+    这里清的是测试进程的内存态。
+    """
+    get_ip_failures_dict().clear()
+    get_global_requests().clear()
+    set_cc_state(False)
 
 TEST_ACCOUNT_ID = "test-account-00000000"
 TEST_ACCOUNT_SLUG = "test-school"
@@ -57,6 +79,9 @@ TEST_TENANT_NAME = TEST_ACCOUNT_NAME
 @pytest_asyncio.fixture(autouse=True)
 async def setup_infra():
     """初始化 PG 表、Redis、确保测试账户存在并设置 ContextVar。"""
+    # 测试之间必须隔离限流状态，否则前一个测试的 4xx 会把 "testclient" 封掉，
+    # 导致后续测试全部 429（详见 _reset_rate_limit_state 的说明）。
+    _reset_rate_limit_state()
     await init_redis()
     await init_db()
     await ensure_tenant_schema(TEST_ACCOUNT_SLUG)
