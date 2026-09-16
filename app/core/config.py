@@ -55,6 +55,15 @@ class CIMSSettings(BaseSettings):
     # 同步账号默认归属的 Account 空间 slug（对应 tenant_<slug> 租户）
     cims_default_account_slug: str = "demo-class"
 
+    # 可信反向代理 / 隧道入口（IP 或 CIDR，逗号分隔，例如 "127.0.0.1,10.0.0.0/8"）。
+    # 只有当请求的对端落在这些网段内时，才会采信 CF-Connecting-IP /
+    # X-Forwarded-For / X-Real-IP 来判定客户端真实 IP；否则一律回退到对端 IP。
+    #
+    # 为什么必须显式配置：客户端能自己伪造这些头。若无条件采信，攻击者只要每次
+    # 换一个假 XFF 就能绕过 CCProtectMiddleware 的单 IP 限流。
+    # 留空 = 直连部署（不信任任何代理）。
+    cims_trusted_proxies: str = ""
+
 
 _settings = CIMSSettings()
 
@@ -104,6 +113,9 @@ SYNC_KEY: str = _settings.cims_sync_key
 # 用途：website 镜像过来的账号必须挂在某个 Account 上，否则 GET /account/list 为空，
 # 网站侧的设备广播/控制端点找不到 account，整条链路哑火。
 DEFAULT_ACCOUNT_SLUG: str = _settings.cims_default_account_slug
+
+# 可信反向代理 / 隧道入口网段（原始字符串，解析见 app/core/client_ip.py）
+TRUSTED_PROXIES: str = _settings.cims_trusted_proxies
 
 
 def validate_config() -> None:

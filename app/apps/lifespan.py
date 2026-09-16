@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from app.core.config import (
     validate_config,
+    BASE_DOMAIN,
     CLIENT_PORT,
     MANAGEMENT_PORT,
     ADMIN_PORT,
@@ -71,6 +72,17 @@ async def _startup(app: FastAPI):
     await _reconcile_tenant_schemas()
     logger.info("正在初始化 Redis 连接池...")
     await init_redis()
+
+    # 把限流到底"认不认得真实客户端 IP"打出来。公网部署时这一行不确认，
+    # 后面排"全网设备一起被封"的问题会非常难 —— 现象是集体 429。
+    from app.core.client_ip import describe_trust_config
+
+    logger.info(
+        "客户端 IP 判定：可信代理 = %s（多租户基域 = %s）",
+        describe_trust_config(),
+        BASE_DOMAIN,
+    )
+
     grpc_logger.info("正在启动 gRPC (%d)...", GRPC_PORT)
     grpc_s, cmd_s, sess_m = await serve_grpc()
     app.state.grpc_server = grpc_s

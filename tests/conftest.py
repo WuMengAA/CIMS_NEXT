@@ -1,9 +1,18 @@
 """共享测试夹具 - 初始化 PG、Redis 和默认测试账户。"""
 
 import os
+import sys
+import asyncio
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Windows 默认的 ProactorEventLoop 无法用于 psycopg 的异步模式，
+# 会在夹具初始化阶段报 "Psycopg cannot use the 'ProactorEventLoop' to run in async mode"。
+# 必须在任何事件循环被创建之前切成 SelectorEventLoop。
+# 生产环境跑在 Linux 上，不受这一条影响。
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # 在导入任何依赖 imghdr 的模块之前抑制此弃用警告
 warnings.filterwarnings(
