@@ -34,8 +34,14 @@ class CIMSSettings(BaseSettings):
     database_url: str = ""
     redis_url: str = ""
 
-    # 多租户托管
+    # 多租户托管（主基域：生成对外 URL 时使用，如 ManagementServer）
     cims_base_domain: str = "miniclassisland.com"
+
+    # 额外接受的基域（逗号分隔），**只影响入站 Host 解析**。
+    # 用途：让「内网 <slug>.localhost」与「公网 <slug>.<公网域名>」同时可用，
+    # 不必为了上公网而牺牲内网教室 —— 否则切基域当天所有教室集体 403。
+    # 生成对外 URL 时仍只用 cims_base_domain（对外只有一个规范域名）。
+    cims_extra_base_domains: str = ""
 
     # 四端口分配
     cims_client_port: int = 27041
@@ -94,7 +100,24 @@ REDIS_DB_SESSION: int = 1
 REDIS_DB_CACHE: int = 2
 
 # 多租户托管配置
-BASE_DOMAIN: str = _settings.cims_base_domain
+def _split_domains(*raw: str) -> list:
+    """把逗号分隔的域名串解析成规范化列表（小写、去空白、去前导点、去重）。"""
+    out: list = []
+    for item in raw:
+        for part in (item or "").split(","):
+            d = part.strip().lower().lstrip(".")
+            if d and d not in out:
+                out.append(d)
+    return out
+
+
+# 入站 Host 解析可接受的基域集合，主基域优先
+BASE_DOMAINS: list = _split_domains(
+    _settings.cims_base_domain, _settings.cims_extra_base_domains
+) or ["miniclassisland.com"]
+
+# 主基域（对外 URL 生成用，也是 BASE_DOMAINS[0]）
+BASE_DOMAIN: str = BASE_DOMAINS[0]
 DEFAULT_SCHEMA: str = "public"
 
 # 分区服务端口分配
