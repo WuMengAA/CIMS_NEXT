@@ -278,8 +278,15 @@ async def assign_device_to_class(
     prof = (
         await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
     ).scalar_one_or_none()
+    # 自动建档：设备可能还没上报过心跳（刚装机、或想提前预绑定），此前这里直接
+    # 404「配置档案不存在」，导致面板上看得见设备却绑不了班。改为按需建空档
+    # （class_id 随后由下面统一赋值），使「先指派、后装机」也能生效——装好一启动
+    # 就直接拿到本班课表，不必等现场再补一次操作。
+    created_profile = False
     if not prof:
-        raise HTTPException(404, f"设备 {client_id} 的配置档案不存在")
+        prof = ClientProfile(client_id=client_id)
+        db.add(prof)
+        created_profile = True
 
     prev = prof.class_id or ""
     if prev and prev != class_id and not force:
@@ -300,6 +307,7 @@ async def assign_device_to_class(
         "class_id": class_id,
         "previous_class_id": prev,
         "transferred": bool(prev and prev != class_id),
+        "created_profile": created_profile,
     }
 
 

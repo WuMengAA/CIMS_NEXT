@@ -107,6 +107,23 @@ async def report_client_status(
         )
     row.reported_at = _now()
 
+    # 设备首次上报即建档（client_profiles）—— 让面板能把它指派进班级。
+    #
+    # 背景：`/device/assign`（设备划入班级）要求档案存在，而此前**没有任何生产
+    # 代码路径**会创建档案（只有租户初始化脚本会建），于是「新装的教室机」会陷入
+    # 一个极难自查的状态：面板上看得见它（心跳进了 client_status）、却绑不了班
+    # （assign 返回 404「配置档案不存在」）—— 界面有这台机器，点了就是失败。
+    #
+    # 这里按最小侵入自愈：档案已存在则**一个字段都不动**（绝不覆盖已指派的班级），
+    # 不存在才按默认资源名建一条空档（class_id 留空，等管理端指派）。
+    prof = (
+        await db.execute(
+            select(ClientProfile).where(ClientProfile.client_id == client_id)
+        )
+    ).scalar_one_or_none()
+    if prof is None:
+        db.add(ClientProfile(client_id=client_id))
+
     await db.commit()
     return {"client_id": client_id, "reported": True, "server_time": row.reported_at.isoformat()}
 
