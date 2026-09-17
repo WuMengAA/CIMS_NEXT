@@ -48,14 +48,21 @@ packages = ["app"]
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-W ignore::DeprecationWarning:imghdr"
+# ⚠️ 这里原先写着 addopts = "-W ignore::DeprecationWarning:imghdr" —— 它**是死代码**：
+# pytest 的过滤顺序是「命令行 -W 先、ini filterwarnings 后」，后者里第一条就是 "error"，
+# 会把前面 -W 的 ignore 覆盖掉。所以真正生效的只有下面 filterwarnings。
+# 而下面那条 "ignore:imghdr was removed:..." **也没生效** —— warnings 过滤器的 message
+# 是**从消息开头**做正则匹配，而实际消息是
+# "'imghdr' is deprecated and slated for removal in Python 3.13"，对不上，于是被 "error" 捕获，
+# 变成 6 个文件全部 collection error（pgpy → imghdr 是必经之路）。
+addopts = ""
 filterwarnings = [
     "error",
     "ignore::cryptography.utils.CryptographyDeprecationWarning",
     "ignore:Selected compression algorithm:UserWarning",
     "ignore::pytest.PytestUnraisableExceptionWarning",
     "ignore:coroutine.*was never awaited:RuntimeWarning",
-    "ignore:imghdr was removed:DeprecationWarning",
+    "ignore:'imghdr' is deprecated:DeprecationWarning",
 ]
 
 [tool.coverage.run]
