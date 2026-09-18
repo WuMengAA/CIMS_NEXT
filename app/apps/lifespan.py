@@ -4,6 +4,7 @@
 """
 
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -95,3 +96,11 @@ async def _startup(app: FastAPI):
         ADMIN_PORT,
         GRPC_PORT,
     )
+
+    # 启动定时广播调度器（后台常驻任务）
+    from app.services.scheduled_broadcast import run_scheduler
+
+    stop_event = asyncio.Event()
+    app.state.scheduler_stop = stop_event
+    app.state.scheduler_task = asyncio.create_task(run_scheduler(stop_event))
+    logger.info("定时广播调度器任务已创建")

@@ -20,6 +20,7 @@ from .user_info_username import router as uname_r
 from .user_password import router as pwd_r
 from .class_routes import router as class_r
 from .class_import_routes import router as class_import_r
+from .scheduled_broadcast import router as scheduled_broadcast_r
 
 router = APIRouter()
 
@@ -48,3 +49,6 @@ router.include_router(pwd_r, prefix="/user/info/password", tags=["UserInfo"])
 router.include_router(class_r, prefix="/class", tags=["Class"])
 # /class/*（手动添加课表 + 从官方档案导入；与上面同前缀，仅关注点不同）
 router.include_router(class_import_r, prefix="/class", tags=["Class"])
+
+# /scheduled-broadcast/*（P2 定时广播配置 CRUD）
+router.include_router(scheduled_broadcast_r, prefix="/scheduled-broadcast", tags=["ScheduledBroadcast"])

@@ -19,4 +19,15 @@ async def _shutdown(app):
         grpc_logger.info("gRPC 服务器已停止")
     logger.info("正在关闭 Redis 连接池...")
     await close_redis()
+
+    # 停止定时广播调度器
+    stop_event = getattr(app.state, "scheduler_stop", None)
+    task = getattr(app.state, "scheduler_task", None)
+    if stop_event is not None:
+        stop_event.set()
+    if task is not None:
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
     logger.info("系统停机完成")

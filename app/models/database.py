@@ -26,6 +26,7 @@ from .resource_files import (
 from .client import ClientRecord, ClientProfile, ClientStatus
 from .class_model import Class, ClassResourceSet
 from .command_queue import CommandQueueRecord
+from .scheduled_broadcast import ScheduledBroadcast
 from .audit import AuditLog
 from .config_upload import ConfigUploadRecord
 from .engine import AsyncSessionLocal, init_db
@@ -56,6 +57,7 @@ __all__ = [
     "Class",
     "ClassResourceSet",
     "CommandQueueRecord",
+    "ScheduledBroadcast",
     "AuditLog",
     "ConfigUploadRecord",
     "AsyncSessionLocal",
