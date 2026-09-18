@@ -228,6 +228,9 @@ async def device_status(db: AsyncSession = Depends(get_db)):
             {
                 "client_id": cid,
                 "class_id": (prof.class_id if prof else "") or "",
+                # bound=false 即"尚未绑定班级"：面板据此高亮 + 指派下拉，
+                # 插件端据此弹 OOBE 引导，消除"新机器自动归1班且找不到绑定入口"。
+                "bound": bool(prof.class_id if prof else ""),
                 "class_name": class_names.get((prof.class_id if prof else "") or "", ""),
                 "online": age is not None and age <= FRESH_SECONDS,
                 "reported": st is not None,
@@ -248,6 +251,11 @@ async def device_status(db: AsyncSession = Depends(get_db)):
         "count": len(devices),
         "online_count": sum(1 for d in devices if d["online"]),
         "devices": devices,
+        # 可选班级清单（指派下拉用）：与 classes 同源，但只暴露 class_id/name。
+        "suggest": [
+            {"class_id": c.id, "name": c.name}
+            for c in classes
+        ],
         "classes": [
             {
                 "class_id": c.id,

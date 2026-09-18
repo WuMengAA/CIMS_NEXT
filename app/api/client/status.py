@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import get_db, ClientProfile, ClientStatus
+from app.models.class_model import Class
 
 router = APIRouter()
 
@@ -167,10 +168,26 @@ async def read_client_status(
             "client_id": client_id,
             "reported": False,
             "class_id": class_id,
+            # bound=false 让插件端立刻知道"还没绑定班级"，从而弹出 OOBE 引导
+            # （而不是默默用本地默认档案的 1 班，造成"自动归到一班"的假象）。
+            "bound": bool(class_id),
             "message": "该设备尚未上报过状态",
         }
 
     age = (_now() - row.reported_at).total_seconds() if row.reported_at else None
+    # 可选班级清单：未绑定设备经此知道"能绑哪些班"，供插件 OOBE / 面板下拉使用。
+    # 只在未绑定时查询，已绑定则不必再拉（省一次 SQL）。
+    suggest = []
+    if not class_id:
+        try:
+            suggest = [
+                {"class_id": c.id, "name": c.name}
+                for c in (await db.execute(
+                    select(Class).order_by(Class.sort_order, Class.name)
+                )).scalars().all()
+            ]
+        except Exception:
+            suggest = []
     return {
         "client_id": client_id,
         "reported": True,
@@ -182,6 +199,10 @@ async def read_client_status(
         # 管理端指派是权威归属；设备自报值放在 self_reported_class_id 供交叉校验
         "class_id": class_id,
         "self_reported_class_id": row.class_id,
+        # 是否已完成"班级绑定"：未绑定设备的插件端据此弹 OOBE 引导。
+        "bound": bool(class_id),
+        # 未绑定设备的可选班级清单（已绑定则为空数组）。
+        "suggest": suggest,
         "active_class_group": row.active_class_group,
         "modules": _load(row.modules_json, {}),
         "plugins": _load(row.plugins_json, []),
