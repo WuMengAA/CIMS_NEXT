@@ -1,5 +1,6 @@
 """全局应用生命周期 — 优雅停机。"""
 
+import asyncio
 import logging
 
 from app.core.redis.pool import close_redis
