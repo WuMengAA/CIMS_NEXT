@@ -185,6 +185,39 @@ async def device_status(db: AsyncSession = Depends(get_db)):
     all_ids = sorted({p.client_id for p in profs} | set(statuses.keys()))
     profile_by_id = {p.client_id: p for p in profs}
 
+    def _skip_as_orphan(cid: str) -> bool:
+        """同一物理主机若以多个 client_id 上报过，只保留「在线 或 已绑班」的那个活跃身份，
+        把纯孤儿（无心跳/长期离线 且 未绑班）从列表剔除，避免 device-status 出现
+        「同名 host 一在线一离线」的假冲突（例：N7-20091211 既报过 n7-20091211 又报过 lab-pc-001）。"""
+        st = statuses.get(cid)
+        prof = profile_by_id.get(cid)
+        # 有主动绑定或正在线上报 → 绝不当作孤儿
+        if prof is not None and prof.class_id:
+            return False
+        if st is not None and st.reported_at is not None:
+            age = (now - st.reported_at).total_seconds()
+            if age <= FRESH_SECONDS:
+                return False
+        # 检查是否有其它同 host 身份在当前更活跃/已绑定
+        if st and st.host:
+            dupes = [
+                o for o in all_ids
+                if o != cid and statuses.get(o) and statuses[o].host == st.host
+            ]
+            active = [
+                o for o in dupes
+                if (profile_by_id.get(o) and profile_by_id[o].class_id)
+                or (
+                    statuses.get(o) and statuses[o].reported_at
+                    and (now - statuses[o].reported_at).total_seconds() <= FRESH_SECONDS
+                )
+            ]
+            if active:
+                return True
+        return False
+
+    all_ids = [cid for cid in all_ids if not _skip_as_orphan(cid)]
+
     for cid in all_ids:
         prof = profile_by_id.get(cid)
         st = statuses.get(cid)
