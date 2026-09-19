@@ -108,6 +108,61 @@ async def poll_queued_commands(
     return {"client_id": client_id, "count": len(commands), "commands": commands}
 
 
+@router.get("/v1/client/{client_id}/command/stats")
+async def queued_command_stats(
+    request: Request,
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """**只读**命令队列健康度：各状态计数 + 最老的 pending 时间。
+
+    为什么必须单独开一个只读接口（而不是复用 /command/queued）：
+      `/command/queued` 是**取走**语义 —— 读一次就把命令标记为 delivered（等客户端
+      ack），原子生效。把它当成「看看有没有积压」的探针用，会**静默吃掉真实命令**：
+      面板点了"检测"，教室里那条广播就再也不会播，且两边都不报错。
+      诊断必须走只读路径。
+
+    用途（判读方法）：
+      · 持久 pending   = 设备根本没在轮询（插件没跑 / 设备离线）；
+      · delivered 不 done = 插件取走了但执行后没 ack（执行报错 / ack 链路断）；
+      · failed         = 明确执行失败，可人工介入。
+    """
+    slug = getattr(request.state, "tenant_slug", "Unknown")
+    sel = (
+        select(
+            CommandQueueRecord.ack_status,
+            func.count(CommandQueueRecord.id),
+            func.min(CommandQueueRecord.created_at),
+        )
+        .where(CommandQueueRecord.client_id == client_id)
+        .group_by(CommandQueueRecord.ack_status)
+    )
+    rows = (await db.execute(sel)).all()
+
+    by_status: dict[str, int] = {}
+    oldest_pending = None
+    for status, count, oldest in rows:
+        key = str(status or "unknown")
+        by_status[key] = int(count or 0)
+        if key == "pending" and oldest is not None:
+            if oldest_pending is None or oldest < oldest_pending:
+                oldest_pending = oldest
+
+    logger.info(
+        "[%s][client=%s] 队列只读统计: %s（不取走命令）", slug, client_id, by_status
+    )
+    return {
+        "client_id": client_id,
+        "total": sum(by_status.values()),
+        "pending": by_status.get("pending", 0),
+        "delivered": by_status.get("delivered", 0),
+        "done": by_status.get("done", 0),
+        "failed": by_status.get("failed", 0),
+        "by_status": by_status,
+        "oldest_pending_at": oldest_pending.isoformat() if oldest_pending else None,
+    }
+
+
 @router.post("/v1/client/{client_id}/command/ack")
 async def ack_commands(
     request: Request,
