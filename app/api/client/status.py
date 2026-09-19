@@ -231,3 +231,31 @@ async def read_client_status(
         "extra": _load(row.extra_json, {}),
         "reported_at": row.reported_at.isoformat() if row.reported_at else None,
     }
+
+
+@router.get("/v1/client/{client_id}/p2p")
+async def client_p2p_credentials(request: Request, client_id: str):
+    """下发本机 WebRTC 远控所需的信令凭据（**被控端**用）。
+
+    与面板走 website `/api/console/ext/p2p-signal` 是**同一算法同一密钥**
+    （``HMAC-SHA256(HMAC_KEY, "p2p:<uid>")`` → hex），因此控制器与被控端无需共享
+    存储即天然拿到同一 secret。
+
+    - 设备身份即租户内的 ``client_id``（与 manifest / status 同一身份，无需额外凭证）；
+    - 顺手把令牌注入信令边车（幂等；边车未起则忽略，**不阻塞**设备取凭据）。
+    """
+    from fastapi.responses import JSONResponse
+
+    try:
+        from app.ext.p2p_signal import p2p_credentials, register_device
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"p2p 模块不可用：{exc}"}, status_code=503)
+    try:
+        cred = p2p_credentials(client_id)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    try:
+        register_device(client_id, cred["secret"])
+    except Exception:  # noqa: BLE001
+        pass  # 边车没起不该妨碍设备取凭据（面板会按 signalUrl 自行重试）
+    return {"client_id": client_id, **cred}

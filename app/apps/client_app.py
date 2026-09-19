@@ -8,6 +8,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.client.router import router as client_router
+from app.api.client.signal_proxy import router as signal_proxy_router
 from app.api.client.token_get import router as token_get_router
 from app.api.management_config.routes import router as mc_router
 from app.core.auth.http_middleware import TenantMiddleware
@@ -40,6 +41,8 @@ apply_app_safeguards(client_app)
 client_app.include_router(client_router, prefix="/api", tags=["Client"])
 client_app.include_router(mc_router, prefix="/api", tags=["Guide"])
 client_app.include_router(token_get_router, tags=["TokenGet"])
+# P2P 信令公网入口（/socket.io/* → 本机信令边车 :18110）。放在最后：路径前缀独立，无遮蔽风险。
+client_app.include_router(signal_proxy_router)
 
 
 @client_app.get("/")

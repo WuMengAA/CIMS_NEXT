@@ -127,6 +127,10 @@ celerybeat.pid
 
 # Environments
 .env
+# 手工备份的 .env（含明文密钥）。标准 .env 规则用的是精确名，匹配不到
+# 「.env.bak-20260917-beforedomain」这类带后缀的副本 —— 曾因此差点误提交，补规则。
+.env.bak-*
+*.env.bak*
 .venv
 env/
 venv/

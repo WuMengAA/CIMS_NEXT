@@ -59,6 +59,17 @@ async def _start_servers():
     """
     _write_pid()
 
+    # P2P 信令边车：启动期**尽力**拉起（失败只告警，绝不阻断 CIMS 启动）。
+    # 用 to_thread 包住同步 urllib 探测（3s 超时），避免阻塞事件循环；
+    # 常驻保活交给 Windows 计划任务 / guard-signaling.ps1。
+    try:
+        from app.ext.p2p_signal import ensure_sidecar
+
+        ready = await asyncio.to_thread(ensure_sidecar)
+        logger.info("P2P 信令边车：%s", "已就绪" if ready else "未就绪（可由守护脚本稍后拉起）")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("P2P 信令边车拉起失败（忽略，不影响 CIMS 启动）：%s", exc)
+
     # uvicorn 配置：禁用默认日志，由 app.core.logging 统一接管
     uv_log_config = {
         "version": 1,

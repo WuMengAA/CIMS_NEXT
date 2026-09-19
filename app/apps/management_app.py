@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.management.router import router as mgr_router
 from app.api.management.account_router import router as acct_router
+from app.ext.p2p_signal.router import router as p2p_router
 from app.core.auth.admin_middleware import AdminAuthMiddleware
 from app.core.auth.account_middleware import AccountContextMiddleware
 from app.core.logging import RequestLoggingMiddleware, PORT_TAG_MGMT
@@ -48,6 +49,9 @@ apply_app_safeguards(management_app)
 # 挂载路由
 management_app.include_router(mgr_router)
 management_app.include_router(acct_router)
+# P2P 信令边车接缝：GET /p2p-signal/health（探活）、POST /p2p-signal/register（注入设备令牌）。
+# 刻意**不加入** AdminAuthMiddleware 的免认证白名单 —— 它属于管理端能力，须带会话令牌。
+management_app.include_router(p2p_router)
 
 
 @management_app.get("/")
