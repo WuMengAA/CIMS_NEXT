@@ -51,6 +51,9 @@ class ClientStatus(Base):
     host: Mapped[str] = mapped_column(String, default="", server_default=text("''"))
     ip: Mapped[str] = mapped_column(String, default="", server_default=text("''"))
     version: Mapped[str] = mapped_column(String, default="", server_default=text("''"))
+    # 设备运行系统（设备级属性）：Windows / macOS / Linux …
+    # 班级编号里的「xx届x班_设备运行系统」由它拼出（见 class_model.combine_device_label）。
+    os_name: Mapped[str] = mapped_column(String(32), default="", server_default=text("''"))
     # 设备自报的所属班级（管理端 client_profiles.class_id 才是权威；
     # 这里冗余一份用于交叉校验「设备认为自己属于哪个班」与「管理端指派是否一致」）
     class_id: Mapped[str] = mapped_column(

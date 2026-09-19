@@ -541,16 +541,30 @@ async def write_shared_resources(db, parsed: ProfileParseResult) -> dict[str, in
 
 
 async def create_class_records(db, imp: ClassImport) -> None:
-    """写一份班级课表资源 + classes 行 + class_resource_sets 行（幂等）。"""
+    """写一份班级课表资源 + classes 行 + class_resource_sets 行（幂等）。
+
+    ⚠️ 重构后语义（2026-09-20）：班级**不再由课表派生**。此处是「从官方档案显式导入」
+    这条受控链路，仅负责把班级记录补齐，以便承载导入的课表资源；这样产生的班级
+    一律视为**系统班级**（`owner_user_id=""`）并直接标记 `approved`，从而不会被
+    新增的审核门控挡住。真正的班级创建入口是管理端「文件夹式」新建（带属主+审核）。
+    """
     from sqlalchemy import select
 
-    from app.models.class_model import Class, ClassResourceSet
+    from app.models.class_model import Class, ClassResourceSet, REVIEW_APPROVED
 
     await upsert_resource(db, "ClassPlan", imp.class_plan_name, imp.class_plan_resource)
 
     cls = (await db.execute(select(Class).where(Class.id == imp.class_id))).scalar_one_or_none()
     if cls is None:
-        cls = Class(id=imp.class_id, name=imp.name, resource_set_id=imp.class_id, sort_order=imp.index)
+        cls = Class(
+            id=imp.class_id,
+            name=imp.name,
+            code=imp.name,
+            resource_set_id=imp.class_id,
+            sort_order=imp.index,
+            owner_user_id="",
+            review_status=REVIEW_APPROVED,
+        )
     cls.name = imp.name
     cls.sort_order = imp.index
     db.add(cls)

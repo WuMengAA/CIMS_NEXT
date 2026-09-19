@@ -15,15 +15,29 @@
 
 import json
 from datetime import datetime, timezone
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import Response
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.tenant.context import get_tenant_id
 from app.models.session import get_db
-from app.models.class_model import Class, ClassResourceSet
-from app.models.client import ClientProfile
+from app.models.class_model import (
+    Class,
+    ClassAuditLog,
+    ClassPreview,
+    ClassResourceSet,
+    REVIEW_APPROVED,
+    REVIEW_PENDING,
+    REVIEW_REJECTED,
+    combine_device_label,
+    make_class_code,
+    make_class_id,
+)
+from app.models.client import ClientProfile, ClientStatus
 from app.models.command_queue import CommandQueueRecord
+from app.models.custom_role import CustomRole
+from app.models.user import User
 from app.api.command.model_map import MODEL_MAP
 from app.api.command.payload_validator import validate_payload
 from app.api.command.version_check import check_version
@@ -31,6 +45,15 @@ from app.api.command.timetable_validator import validate_classplan_references
 from app.services.schedule_importer import DEFAULT_GROUP_GUID, GLOBAL_GROUP_GUID
 
 router = APIRouter()
+
+# 审核门槛：角色 priority ≥ 该值视为「可审核」（管理员/所有者）。
+# 后续若新增独立「审核」角色，只要其 priority 落在此区间即自动生效，无需改代码。
+REVIEW_MIN_PRIORITY = 80
+
+# 班级预览图规格（服务端强校验，避免各端缩放口径不一致导致卡片错位）
+PREVIEW_W = 160
+PREVIEW_H = 90
+PREVIEW_MAX_BYTES = 256 * 1024
 
 # resource_type → class_resource_sets 列
 RESOURCE_TO_CRS_COL = {
@@ -81,35 +104,232 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+# --------------------------------------------------------------------------- #
+# 审核 / 隔离 / 预览 工具
+# --------------------------------------------------------------------------- #
+
+
+async def _actor_priority(db: AsyncSession, user_id: str) -> int:
+    """查当前用户的全局角色优先级（无用户/无角色→0）。
+
+    `users` / `custom_roles` 是 public 全局表；租户会话的 search_path 为
+    ``"tenant_x", public``，因此可直接查询、无需切 schema。
+    """
+    if not user_id:
+        return 0
+    role_code = (
+        await db.execute(select(User.role_code).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if not role_code:
+        return 0
+    pr = (
+        await db.execute(select(CustomRole.priority).where(CustomRole.code == role_code))
+    ).scalar_one_or_none()
+    return int(pr or 0)
+
+
+async def _is_reviewer(db: AsyncSession, user_id: str) -> bool:
+    """是否具备审核权限（管理员/所有者及以上）。"""
+    return await _actor_priority(db, user_id) >= REVIEW_MIN_PRIORITY
+
+
+def _audit(
+    db: AsyncSession, class_id: str, actor: str, action: str, detail: dict | None = None
+) -> None:
+    """写一条班级审计流水（append-only，随当前事务一起提交）。"""
+    db.add(
+        ClassAuditLog(
+            class_id=class_id or "",
+            actor_user_id=actor or "",
+            action=action,
+            detail=json.dumps(detail or {}, ensure_ascii=False),
+            created_at=_now(),
+        )
+    )
+
+
+def _jpeg_size(raw: bytes) -> tuple[int, int] | None:
+    """纯 Python 解析 JPEG 宽高（读 SOF 段），不引入 Pillow 依赖。
+
+    返回 ``(width, height)``；非 JPEG 或解析失败返回 ``None``。
+    """
+    if len(raw) < 4 or raw[0] != 0xFF or raw[1] != 0xD8:  # SOI
+        return None
+    i, n = 2, len(raw)
+    while i + 9 < n:
+        if raw[i] != 0xFF:
+            i += 1
+            continue
+        marker = raw[i + 1]
+        if marker == 0xFF:  # 填充字节
+            i += 1
+            continue
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:  # 无长度字段
+            i += 2
+            continue
+        seg_len = (raw[i + 2] << 8) | raw[i + 3]
+        # SOF0..SOF15（排除 DHT=C4 / JPG=C8 / DAC=CC）承载宽高
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height = (raw[i + 5] << 8) | raw[i + 6]
+            width = (raw[i + 7] << 8) | raw[i + 8]
+            return width, height
+        i += 2 + seg_len
+    return None
+
+
 @router.post("/create")
 async def create_class(
-    class_id: str,
-    name: str,
+    request: Request,
+    class_id: str = "",
+    name: str = "",
+    graduation_year: int | None = None,
+    class_number: int | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """创建班级并绑定一份默认资源集。
+    """创建班级（**文件夹式**，不再由课表派生）。
 
-    class_id 建议形如 class_3p1（人可读）。同一租户内唯一。
+    两种调用方式：
+
+    1. 结构化（推荐）：传 `graduation_year` + `class_number`
+       → 内部主键自动生成 `class_2025_3`，编号 `code` 为 `2025届3班`；
+    2. 旧式兼容：只传 `class_id` + `name`（无届/班号，`code` 回落到 `name`）。
+
+    审核态：
+      · 审核人（管理员/所有者）创建 → 直接 `approved`；
+      · 普通用户创建 → `pending`（**待审**，通过审核前不允许绑定设备）。
     """
     tid = get_tenant_id()
     if not tid:
         raise HTTPException(400, "租户上下文缺失")
+
+    actor = getattr(request.state, "current_user_id", "") or ""
+    reviewer = await _is_reviewer(db, actor)
+
+    structured = graduation_year is not None and class_number is not None
+    if not class_id:
+        if not structured:
+            raise HTTPException(400, "请提供 class_id，或同时提供 graduation_year 与 class_number")
+        class_id = make_class_id(graduation_year, class_number)
+
+    code = make_class_code(graduation_year, class_number) if structured else (name or class_id)
+    if not name:
+        name = code
+
     exists = (
         await db.execute(select(Class).where(Class.id == class_id))
     ).scalar_one_or_none()
     if exists:
         raise HTTPException(409, f"班级 {class_id} 已存在")
 
+    status = REVIEW_APPROVED if reviewer else REVIEW_PENDING
     rs = ClassResourceSet(resource_set_id=class_id, updated_at=_now(), **DEFAULT_RESOURCE)
-    cls = Class(id=class_id, name=name, resource_set_id=class_id, created_at=_now(), updated_at=_now())
+    cls = Class(
+        id=class_id,
+        name=name,
+        code=code,
+        graduation_year=graduation_year,
+        class_number=class_number,
+        resource_set_id=class_id,
+        sort_order=int(class_number or 0),
+        owner_user_id=actor,
+        review_status=status,
+        reviewed_by=actor if reviewer else "",
+        reviewed_at=_now() if reviewer else None,
+        created_at=_now(),
+        updated_at=_now(),
+    )
     db.add(rs)
     db.add(cls)
+    _audit(db, class_id, actor, "create", {"name": name, "code": code, "review_status": status})
     await db.commit()
     return {
         "status": "success",
         "class_id": class_id,
+        "code": code,
         "resource_set_id": class_id,
-        "message": f"班级 {name} 已创建",
+        "owner_user_id": actor,
+        "review_status": status,
+        "message": f"班级 {name} 已创建" + ("（待审核）" if status == REVIEW_PENDING else ""),
+    }
+
+
+@router.get("/pending")
+async def list_pending_classes(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """列出**待审核**班级（仅审核人可见）。
+
+    供管理端「审核队列」视图使用：普通用户新建的班级落在这里，
+    审核通过后才会出现在可绑定设备的下拉里。
+    """
+    actor = getattr(request.state, "current_user_id", "") or ""
+    if not await _is_reviewer(db, actor):
+        raise HTTPException(403, "无权查看审核队列（需要审核/管理及以上角色）")
+
+    rows = (
+        await db.execute(
+            select(Class).where(Class.review_status == REVIEW_PENDING).order_by(Class.created_at)
+        )
+    ).scalars().all()
+    return {
+        "status": "success",
+        "count": len(rows),
+        "classes": [
+            {
+                "class_id": c.id,
+                "code": c.code,
+                "name": c.name,
+                "owner_user_id": c.owner_user_id,
+                "graduation_year": c.graduation_year,
+                "class_number": c.class_number,
+                "review_status": c.review_status,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in rows
+        ],
+    }
+
+
+@router.post("/{class_id}/review")
+async def review_class(
+    class_id: str,
+    request: Request,
+    action: str = Body(..., embed=True),
+    reason: str = Body("", embed=True),
+    db: AsyncSession = Depends(get_db),
+):
+    """审核班级：`action` 取 `approve` / `reject`（仅审核人）。
+
+    通过后班级才允许绑定设备 / 下发资源；驳回时记录原因（`reject_reason`）。
+    """
+    actor = getattr(request.state, "current_user_id", "") or ""
+    if not await _is_reviewer(db, actor):
+        raise HTTPException(403, "无权审核班级（需要审核/管理及以上角色）")
+
+    cls = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(404, f"班级 {class_id} 不存在")
+
+    act = (action or "").strip().lower()
+    if act not in ("approve", "reject"):
+        raise HTTPException(400, "action 必须是 approve 或 reject")
+
+    approved = act == "approve"
+    cls.review_status = REVIEW_APPROVED if approved else REVIEW_REJECTED
+    cls.reviewed_by = actor
+    cls.reviewed_at = _now()
+    cls.reject_reason = "" if approved else (reason or "")
+    cls.updated_at = _now()
+    _audit(db, class_id, actor, "approve" if approved else "reject", {"reason": reason})
+    await db.commit()
+    return {
+        "status": "success",
+        "class_id": class_id,
+        "review_status": cls.review_status,
+        "reviewed_by": actor,
+        "reject_reason": cls.reject_reason,
+        "message": f"班级已{'通过审核' if approved else '被驳回'}",
     }
 
 
@@ -170,6 +390,7 @@ async def device_status(db: AsyncSession = Depends(get_db)):
 
     classes = (await db.execute(select(Class).order_by(Class.sort_order, Class.name))).scalars().all()
     class_names = {c.id: c.name for c in classes}
+    class_codes = {c.id: (c.code or c.name) for c in classes}
 
     profs = (await db.execute(select(ClientProfile))).scalars().all()
     statuses = {s.client_id: s for s in (await db.execute(select(ClientStatus))).scalars().all()}
@@ -239,6 +460,7 @@ async def device_status(db: AsyncSession = Depends(get_db)):
                 "host": st.host if st else "",
                 "ip": st.ip if st else "",
                 "version": st.version if st else "",
+                "os_name": st.os_name if st else "",
                 "active_class_group": st.active_class_group if st else "",
                 "modules": _load(st.modules_json if st else None, {}),
                 "plugins": _load(st.plugins_json if st else None, []),
@@ -246,20 +468,41 @@ async def device_status(db: AsyncSession = Depends(get_db)):
             }
         )
 
+    # 班级组合显示名：编号 + 该班设备最常见的运行系统（如 2025届3班_Windows）
+    def _class_display(cid_class: str) -> str:
+        counts: dict[str, int] = {}
+        for d in devices:
+            if (d.get("class_id") or "") == cid_class:
+                o = d.get("os_name") or ""
+                if o:
+                    counts[o] = counts.get(o, 0) + 1
+        dom = max(counts.items(), key=lambda kv: kv[1])[0] if counts else ""
+        return combine_device_label(class_codes.get(cid_class, cid_class), dom)
+
     return {
         "fresh_seconds": FRESH_SECONDS,
         "count": len(devices),
         "online_count": sum(1 for d in devices if d["online"]),
         "devices": devices,
-        # 可选班级清单（指派下拉用）：与 classes 同源，但只暴露 class_id/name。
+        # 可选班级清单（指派下拉用）：只暴露展示与门控所需字段
         "suggest": [
-            {"class_id": c.id, "name": c.name}
+            {
+                "class_id": c.id,
+                "name": c.name,
+                "code": class_codes.get(c.id, ""),
+                "display_code": _class_display(c.id),
+                "review_status": c.review_status,
+                "reviewable": (c.review_status or REVIEW_PENDING) == REVIEW_APPROVED,
+            }
             for c in classes
         ],
         "classes": [
             {
                 "class_id": c.id,
                 "name": c.name,
+                "code": class_codes.get(c.id, ""),
+                "display_code": _class_display(c.id),
+                "review_status": c.review_status,
                 "devices": sorted(p.client_id for p in profs if p.class_id == c.id),
             }
             for c in classes
@@ -268,23 +511,70 @@ async def device_status(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/list")
-async def list_classes(db: AsyncSession = Depends(get_db)):
-    """列出全部班级（含设备数）。"""
-    rows = (await db.execute(select(Class).order_by(Class.sort_order, Class.name))).scalars().all()
+async def list_classes(
+    request: Request,
+    scope: str = "auto",
+    db: AsyncSession = Depends(get_db),
+):
+    """列出班级（含设备数与组合显示名）。
+
+    **多用户隔离**（`scope`）：
+      · `auto`（默认）：审核人看到全部；普通用户只看**自己创建的**班级，
+        外加**无属主的历史/系统班级**（否则老数据会在界面上凭空消失）；
+      · `mine`：强制只看自己创建的；
+      · `all`：仅审核人可用，越权返回 403。
+
+    每项附带 `display_code` —— 班级编号 + 该班设备最常见的运行系统，
+    例如 `2025届3班_Windows`；运行系统取自设备级心跳（`client_status.os_name`）。
+    """
+    actor = getattr(request.state, "current_user_id", "") or ""
+    reviewer = await _is_reviewer(db, actor)
+
+    stmt = select(Class)
+    if scope == "all":
+        if not reviewer:
+            raise HTTPException(403, "无权查看全部班级")
+    elif scope == "mine" or not reviewer:
+        # 自己创建的 + 无属主的历史/系统班级
+        stmt = stmt.where((Class.owner_user_id == actor) | (Class.owner_user_id == ""))
+    stmt = stmt.order_by(Class.sort_order, Class.code, Class.name)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    # 设备归属 + 设备运行系统（各一次查询，避免 N+1）
+    dev_rows = (
+        await db.execute(
+            select(ClientProfile.class_id, ClientProfile.client_id).where(ClientProfile.class_id != "")
+        )
+    ).all()
+    dev_by_class: dict[str, list[str]] = {}
+    for cid_class, cid in dev_rows:
+        dev_by_class.setdefault(cid_class, []).append(cid)
+
+    os_rows = (await db.execute(select(ClientStatus.client_id, ClientStatus.os_name))).all()
+    os_by_client = {cid: (osn or "") for cid, osn in os_rows}
+
     out = []
     for cls in rows:
-        dev_count = (
-            await db.execute(
-                select(func.count()).select_from(ClientProfile).where(ClientProfile.class_id == cls.id)
-            )
-        ).scalar() or 0
+        devs = dev_by_class.get(cls.id, [])
+        counts: dict[str, int] = {}
+        for cid in devs:
+            o = os_by_client.get(cid, "")
+            if o:
+                counts[o] = counts.get(o, 0) + 1
+        dominant_os = max(counts.items(), key=lambda kv: kv[1])[0] if counts else ""
         out.append(
             {
                 "class_id": cls.id,
                 "name": cls.name,
+                "code": cls.code,
+                "display_code": combine_device_label(cls.code or cls.name, dominant_os),
+                "graduation_year": cls.graduation_year,
+                "class_number": cls.class_number,
                 "resource_set_id": cls.resource_set_id,
                 "sort_order": cls.sort_order,
-                "device_count": dev_count,
+                "owner_user_id": cls.owner_user_id,
+                "review_status": cls.review_status,
+                "device_count": len(devs),
                 "updated_at": str(cls.updated_at),
             }
         )
@@ -293,6 +583,7 @@ async def list_classes(db: AsyncSession = Depends(get_db)):
 
 @router.post("/device/assign")
 async def assign_device_to_class(
+    request: Request,
     class_id: str,
     client_id: str,
     force: bool = False,
@@ -315,6 +606,21 @@ async def assign_device_to_class(
     ).scalar_one_or_none()
     if not cls:
         raise HTTPException(404, f"班级 {class_id} 不存在")
+
+    actor = getattr(request.state, "current_user_id", "") or ""
+    reviewer = await _is_reviewer(db, actor)
+
+    # 门控 1 · 内容审核：未通过审核的班级不得绑定设备（杜绝未审内容落到教室大屏）
+    if (cls.review_status or REVIEW_PENDING) != REVIEW_APPROVED:
+        raise HTTPException(
+            409,
+            f"班级「{cls.name or cls.id}」当前状态为 {cls.review_status}，"
+            f"尚未通过审核，暂不能绑定设备。",
+        )
+    # 门控 2 · 多用户隔离：非审核人只能操作自己创建的班级
+    owner = cls.owner_user_id or ""
+    if not reviewer and owner and owner != actor:
+        raise HTTPException(403, "无权操作他人创建的班级")
 
     prof = (
         await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
@@ -341,6 +647,10 @@ async def assign_device_to_class(
         )
 
     prof.class_id = class_id
+    _audit(
+        db, class_id, actor, "assign",
+        {"client_id": client_id, "previous_class_id": prev, "transferred": bool(prev and prev != class_id)},
+    )
     await db.commit()
     return {
         "status": "success",
@@ -354,6 +664,7 @@ async def assign_device_to_class(
 
 @router.post("/device/unassign")
 async def unassign_device_from_class(
+    request: Request,
     client_id: str,
     db: AsyncSession = Depends(get_db),
 ):
@@ -363,9 +674,19 @@ async def unassign_device_from_class(
     ).scalar_one_or_none()
     if not prof:
         raise HTTPException(404, f"设备 {client_id} 的配置档案不存在")
+
+    actor = getattr(request.state, "current_user_id", "") or ""
+    prev = prof.class_id or ""
+    if prev:
+        # 多用户隔离：非审核人不能把设备从别人的班里移出
+        cls = (await db.execute(select(Class).where(Class.id == prev))).scalar_one_or_none()
+        if cls and not await _is_reviewer(db, actor) and (cls.owner_user_id or "") not in ("", actor):
+            raise HTTPException(403, "无权操作他人创建的班级")
+
     prof.class_id = ""
+    _audit(db, prev, actor, "unassign", {"client_id": client_id})
     await db.commit()
-    return {"status": "success", "client_id": client_id, "class_id": ""}
+    return {"status": "success", "client_id": client_id, "class_id": "", "previous_class_id": prev}
 
 
 @router.post("/{class_id}/resource/{resource_type}/write")
@@ -834,3 +1155,145 @@ async def list_class_plan_groups(db: AsyncSession = Depends(get_db)):
         )
     out.sort(key=lambda x: (x["class_id"] or "zzzz"))
     return {"status": "success", "count": len(out), "groups": out}
+
+
+# --------------------------------------------------------------------------- #
+# 班级预览图（160x90 JPEG）—— 管理端查看 / 上传
+#     ⚠️ 单段 GET /{class_id} 必须声明在最后，否则会吞掉 /groups、/list 等静态路由。
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/preview-status")
+async def class_preview_status(db: AsyncSession = Depends(get_db)):
+    """批量返回各班预览图状态（有无 + 更新时间），供图形化卡片一次性渲染。
+
+    刻意只回元数据、不回图片字节：卡片视图先拿到「哪个班有图」，
+    再对可见卡片按需拉 `GET /{class_id}/preview`，避免一次性传输几十张图。
+    """
+    rows = (
+        await db.execute(
+            select(ClassPreview.class_id, ClassPreview.updated_at, ClassPreview.source_client_id)
+        )
+    ).all()
+    return {
+        "status": "success",
+        "count": len(rows),
+        "previews": [
+            {
+                "class_id": cid,
+                "updated_at": upd.isoformat() if upd else None,
+                "source_client_id": src or "",
+            }
+            for cid, upd, src in rows
+        ],
+    }
+
+
+@router.get("/{class_id}/preview")
+async def get_class_preview(class_id: str, db: AsyncSession = Depends(get_db)):
+    """取班级预览图（image/jpeg）；不存在返回 404，前端据此显示占位。"""
+    row = (
+        await db.execute(select(ClassPreview).where(ClassPreview.class_id == class_id))
+    ).scalar_one_or_none()
+    if not row or not row.content:
+        raise HTTPException(404, "该班级暂无预览图")
+    return Response(
+        content=row.content,
+        media_type="image/jpeg",
+        headers={
+            # 预览图每 30s 覆盖一次：禁缓存，避免看到陈旧画面
+            "Cache-Control": "no-store",
+            "X-Preview-Width": str(row.width),
+            "X-Preview-Height": str(row.height),
+            "X-Preview-Updated-At": row.updated_at.isoformat() if row.updated_at else "",
+        },
+    )
+
+
+@router.post("/{class_id}/preview")
+async def upload_class_preview(
+    class_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    client_id: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    """上传 / 覆盖班级预览图。
+
+    **强校验：必须是 160x90 的 JPEG**（≤256KB）—— 各端缩放口径不一致时直接 422，
+    避免卡片因分辨率不同而错位。宽高用纯 Python 解析 JPEG 头，**不引入 Pillow**。
+    """
+    cls = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(404, f"班级 {class_id} 不存在")
+
+    actor = getattr(request.state, "current_user_id", "") or ""
+    owner = cls.owner_user_id or ""
+    # 多用户隔离：带用户身份时，非审核人不能改别人的班（设备端上报无用户身份时放行）
+    if actor and not await _is_reviewer(db, actor) and owner and owner != actor:
+        raise HTTPException(403, "无权修改他人创建的班级预览图")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "空文件")
+    if len(raw) > PREVIEW_MAX_BYTES:
+        raise HTTPException(413, f"预览图过大（{len(raw)} 字节），上限 {PREVIEW_MAX_BYTES}")
+    size = _jpeg_size(raw)
+    if size is None:
+        raise HTTPException(422, "预览图必须是 JPEG 格式")
+    w, h = size
+    if (w, h) != (PREVIEW_W, PREVIEW_H):
+        raise HTTPException(422, f"预览图尺寸必须是 {PREVIEW_W}x{PREVIEW_H}，收到 {w}x{h}")
+
+    row = (
+        await db.execute(select(ClassPreview).where(ClassPreview.class_id == class_id))
+    ).scalar_one_or_none()
+    if row is None:
+        row = ClassPreview(class_id=class_id)
+    row.content = raw
+    row.width = w
+    row.height = h
+    row.source_client_id = client_id or row.source_client_id or ""
+    row.updated_at = _now()
+    db.add(row)
+    _audit(
+        db, class_id, actor, "preview_upload",
+        {"client_id": client_id, "bytes": len(raw), "size": f"{w}x{h}"},
+    )
+    await db.commit()
+    return {"status": "success", "class_id": class_id, "width": w, "height": h, "bytes": len(raw)}
+
+
+@router.get("/{class_id}")
+async def get_class_detail(
+    class_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """班级详情（编号 / 属主 / 审核态 / 资源集）。
+
+    非审核人只能看自己创建的班级或无属主的历史班级（多用户隔离）。
+    """
+    cls = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(404, f"班级 {class_id} 不存在")
+    actor = getattr(request.state, "current_user_id", "") or ""
+    owner = cls.owner_user_id or ""
+    if not await _is_reviewer(db, actor) and owner and owner != actor:
+        raise HTTPException(403, "无权查看他人创建的班级")
+    return {
+        "status": "success",
+        "class_id": cls.id,
+        "name": cls.name,
+        "code": cls.code,
+        "graduation_year": cls.graduation_year,
+        "class_number": cls.class_number,
+        "resource_set_id": cls.resource_set_id,
+        "owner_user_id": cls.owner_user_id,
+        "review_status": cls.review_status,
+        "reviewed_by": cls.reviewed_by,
+        "reviewed_at": cls.reviewed_at.isoformat() if cls.reviewed_at else None,
+        "reject_reason": cls.reject_reason,
+        "created_at": cls.created_at.isoformat() if cls.created_at else None,
+        "updated_at": cls.updated_at.isoformat() if cls.updated_at else None,
+    }

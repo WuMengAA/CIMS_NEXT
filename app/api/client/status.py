@@ -22,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import get_db, ClientProfile, ClientStatus
-from app.models.class_model import Class
+from app.models.class_model import Class, combine_device_label
 
 router = APIRouter()
 
@@ -92,6 +92,9 @@ async def report_client_status(
     row.host = str(body.get("host") or row.host or "")[:255]
     row.ip = str(ip or row.ip or "")[:64]
     row.version = str(body.get("version") or row.version or "")[:64]
+    # 设备运行系统（Windows/macOS/Linux…）：设备级属性，用于拼接班级组合显示名
+    # 「2025届3班_Windows」。兼容两种键名：os_name（新）/ os（部分客户端）。
+    row.os_name = str(body.get("os_name") or body.get("os") or row.os_name or "")[:32]
     row.class_id = str(body.get("class_id") or "")[:128]
     row.active_class_group = str(body.get("active_class_group") or "")[:255]
     row.modules_json = _dump(modules, "{}")
@@ -102,8 +105,8 @@ async def report_client_status(
     else:
         row.extra_json = _dump(
             {k: v for k, v in body.items()
-             if k not in ("host", "version", "class_id", "active_class_group",
-                          "modules", "plugins", "extra")},
+             if k not in ("host", "version", "os_name", "os", "class_id",
+                          "active_class_group", "modules", "plugins", "extra")},
             "{}",
         )
     row.reported_at = _now()
@@ -180,14 +183,29 @@ async def read_client_status(
     suggest = []
     if not class_id:
         try:
+            _classes = (await db.execute(
+                select(Class).order_by(Class.sort_order, Class.code, Class.name)
+            )).scalars().all()
             suggest = [
-                {"class_id": c.id, "name": c.name}
-                for c in (await db.execute(
-                    select(Class).order_by(Class.sort_order, Class.name)
-                )).scalars().all()
+                {
+                    "class_id": c.id,
+                    "name": c.name,
+                    "code": c.code or c.name,
+                    "review_status": c.review_status,
+                    # 只有通过审核的班级可选（与 /class/device/assign 的门控一致），
+                    # 前端据此把待审班级置灰，避免「选了却绑不上」。
+                    "selectable": (c.review_status or "pending") == "approved",
+                }
+                for c in _classes
             ]
         except Exception:
             suggest = []
+
+    # 班级组合显示名（编号_设备运行系统），让设备端一处拿到可直接展示的标签
+    class_code = ""
+    if class_id:
+        _c = (await db.execute(select(Class).where(Class.id == class_id))).scalar_one_or_none()
+        class_code = (_c.code or _c.name) if _c else ""
     return {
         "client_id": client_id,
         "reported": True,
@@ -196,8 +214,12 @@ async def read_client_status(
         "host": row.host,
         "ip": row.ip,
         "version": row.version,
+        "os_name": row.os_name,
         # 管理端指派是权威归属；设备自报值放在 self_reported_class_id 供交叉校验
         "class_id": class_id,
+        "class_code": class_code,
+        # 组合显示名，如「2025届3班_Windows」——设备端可直接展示，无需自己拼
+        "class_display": combine_device_label(class_code, row.os_name),
         "self_reported_class_id": row.class_id,
         # 是否已完成"班级绑定"：未绑定设备的插件端据此弹 OOBE 引导。
         "bound": bool(class_id),
