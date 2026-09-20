@@ -17,12 +17,18 @@ Host 头 `<slug>.<BASE_DOMAIN>` 识别租户，按 client_id 定向，无需会�
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import get_db, ClientProfile, ClientStatus
-from app.models.class_model import Class, combine_device_label, normalize_os_family
+from app.models.class_model import (
+    Class,
+    REVIEW_APPROVED,
+    REVIEW_PENDING,
+    combine_device_label,
+    normalize_os_family,
+)
 
 router = APIRouter()
 
@@ -247,6 +253,103 @@ async def read_client_status(
         "plugins": _load(row.plugins_json, []),
         "extra": _load(row.extra_json, {}),
         "reported_at": row.reported_at.isoformat() if row.reported_at else None,
+    }
+
+
+@router.post("/v1/client/{client_id}/register")
+async def register_device_class(
+    request: Request,
+    client_id: str,
+    body: dict = Body(default_factory=dict),
+    db: AsyncSession = Depends(get_db),
+):
+    """设备自助注册班级（OOBE 收口）。
+
+    与心跳、消息同一条信任链：TenantMiddleware 按 Host 头识别租户、按 client_id
+    定向，无需会话凭证 —— 设备本来就持有该租户的上报身份。这条链路刻意与管理端
+    ``/class/device/assign``（Bearer 鉴权、带审核人/属主门控）区分开：设备没有管理
+    会话，只能自助把**自己**绑到「已通过审核」的班级，不能动别人的班。
+
+    门控（与管理端 assign 的内容审核保持一致）：
+      · 班级不存在 → 404（跨租户的 class_id 在此查不到，天然防越租户绑定）；
+      · 班级未通过审核 → 409（杜绝未审内容经自注册落到教室大屏）；
+      · 设备已绑定到**其它**班 → 409（必须先 unregister / 重新注册才能切换，
+        与「一班一号、不静默抢占」硬约束同语义）；同班则幂等成功。
+    """
+    class_id = (body or {}).get("class_id") or ""
+    if not class_id:
+        raise HTTPException(400, "缺少 class_id")
+
+    cls = (
+        await db.execute(select(Class).where(Class.id == class_id))
+    ).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(404, f"班级 {class_id} 不存在")
+    if (cls.review_status or REVIEW_PENDING) != REVIEW_APPROVED:
+        raise HTTPException(
+            409,
+            f"班级「{cls.name or cls.id}」尚未通过审核，暂不能绑定。",
+        )
+
+    prof = (
+        await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
+    ).scalar_one_or_none()
+    if prof is None:
+        prof = ClientProfile(client_id=client_id)
+        db.add(prof)
+
+    prev = prof.class_id or ""
+    if prev and prev != class_id:
+        raise HTTPException(
+            409,
+            f"本设备已属于「{prev}」，请先解除绑定（重新注册）后再切换到本班。",
+        )
+
+    prof.class_id = class_id
+    await db.commit()
+
+    class_code = cls.code or cls.name
+    os_name = (await db.execute(
+        select(ClientStatus.os_name).where(ClientStatus.client_id == client_id)
+    )).scalar_one_or_none() or ""
+    return {
+        "status": "success",
+        "client_id": client_id,
+        "class_id": class_id,
+        "class_code": class_code,
+        "class_display": combine_device_label(class_code, os_name),
+        "previous_class_id": prev,
+        "registered": True,
+        "bound": True,
+    }
+
+
+@router.post("/v1/client/{client_id}/unregister")
+async def unregister_device_class(
+    request: Request,
+    client_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """设备自助解除班级绑定（重新注册入口）。
+
+    与 register 同一信任链（租户 + client_id 定向）。解绑后下次心跳回读
+    bound=false，插件端 OOBE 引导会重新弹出，引导教师重新选班。
+    """
+    prof = (
+        await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
+    ).scalar_one_or_none()
+    if prof is None:
+        raise HTTPException(404, f"设备 {client_id} 的配置档案不存在")
+    prev = prof.class_id or ""
+    prof.class_id = ""
+    await db.commit()
+    return {
+        "status": "success",
+        "client_id": client_id,
+        "class_id": "",
+        "previous_class_id": prev,
+        "registered": False,
+        "bound": False,
     }
 
 
