@@ -24,6 +24,7 @@
 每个租户 Schema 自动建表，天然实现「同一租户内班级隔离」。
 """
 
+import re
 import uuid
 from datetime import datetime
 
@@ -61,6 +62,42 @@ def combine_device_label(code: str, os_name: str) -> str:
     if code and os_name:
         return f"{code}_{os_name}"
     return code or os_name
+
+
+# --------------------------------------------------------------------------- #
+# 运行系统归一化
+# --------------------------------------------------------------------------- #
+# .NET 的 `Environment.OSVersion.VersionString` 在 Windows 上给出的是
+# 「Microsoft Windows NT 10.0.26200.0」这种长串，直接拼进组合显示名就是
+# 「2025届3班_Microsoft Windows NT 10.0.26200.0」—— 又长又会被 32 字符截断。
+# 组合显示名只需要「Windows / macOS / Linux」这一级粒度，故在此归一。
+_OS_FAMILY_RES: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"windows", re.I), "Windows"),
+    (re.compile(r"\bmac\s?os\b|macos|darwin|osx", re.I), "macOS"),
+    (re.compile(r"\blinux\b", re.I), "Linux"),
+    (re.compile(r"\bandroid\b", re.I), "Android"),
+    (re.compile(r"\bios\b", re.I), "iOS"),
+    (re.compile(r"\bfreebsd\b", re.I), "FreeBSD"),
+)
+
+
+def normalize_os_family(raw: str, max_len: int = 16) -> str:
+    """把客户端上报的运行系统串归一成**家族名**，如 ``Windows``。
+
+    已知家族（Windows/macOS/Linux/Android/iOS/FreeBSD）按关键字识别；
+    识别不出时退回首个词（例如 macOS/Linux 在 .NET 下都会报 ``Unix 24.1.0``，
+    此时只能得到笼统的 ``Unix``）—— 总比把整条版本串塞进显示名要好。
+
+    归一不到任何非空内容时返回空串，由调用方决定是否沿用旧值。
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    for pattern, family in _OS_FAMILY_RES:
+        if pattern.search(s):
+            return family
+    head = s.split()[0].strip(" .,;:()[]") if s.split() else ""
+    return (head or s)[:max_len]
 
 
 class Class(Base):

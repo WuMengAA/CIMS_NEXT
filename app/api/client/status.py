@@ -22,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import get_db, ClientProfile, ClientStatus
-from app.models.class_model import Class, combine_device_label
+from app.models.class_model import Class, combine_device_label, normalize_os_family
 
 router = APIRouter()
 
@@ -93,8 +93,25 @@ async def report_client_status(
     row.ip = str(ip or row.ip or "")[:64]
     row.version = str(body.get("version") or row.version or "")[:64]
     # 设备运行系统（Windows/macOS/Linux…）：设备级属性，用于拼接班级组合显示名
-    # 「2025届3班_Windows」。兼容两种键名：os_name（新）/ os（部分客户端）。
-    row.os_name = str(body.get("os_name") or body.get("os") or row.os_name or "")[:32]
+    # 「2025届3班_Windows」。
+    #
+    # ⚠️ 三种取法都要试，缺一不可：
+    #   1. 顶层 `os_name` —— 目标契约（新客户端应报这个）；
+    #   2. 顶层 `os`      —— 部分客户端的简写；
+    #   3. `extra.os`     —— **已部署插件实际用的位置**（StelarithStatusReporter
+    #      把 `os` 放进了 `extra` 字典，而 extra 是整体原样落库的，于是后端
+    #      一直读不到，os_name 恒为空、组合显示名永远只有「2025届3班」）。
+    #      在这里兜住它，可以让**存量插件不改包**就立刻生效。
+    # 取到后统一归一成家族名，避免把「Microsoft Windows NT 10.0.26200.0」拼进去。
+    _extra_dict = extra if isinstance(extra, dict) else {}
+    _os_raw = (
+        body.get("os_name")
+        or body.get("os")
+        or _extra_dict.get("os_name")
+        or _extra_dict.get("os")
+        or ""
+    )
+    row.os_name = (normalize_os_family(str(_os_raw)) or row.os_name or "")[:32]
     row.class_id = str(body.get("class_id") or "")[:128]
     row.active_class_group = str(body.get("active_class_group") or "")[:255]
     row.modules_json = _dump(modules, "{}")
