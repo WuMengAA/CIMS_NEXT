@@ -585,6 +585,9 @@ async def list_classes(
                 "sort_order": cls.sort_order,
                 "owner_user_id": cls.owner_user_id,
                 "review_status": cls.review_status,
+                # 驳回原因一并下发：否则被驳回的班级在界面上只剩一个「已驳回」标签，
+                # 提交人看不到为什么被拒，只能反复重提交 —— 审核闭环断在这里。
+                "reject_reason": cls.reject_reason or "",
                 "device_count": len(devs),
                 "updated_at": str(cls.updated_at),
             }
