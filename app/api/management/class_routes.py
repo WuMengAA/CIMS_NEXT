@@ -553,6 +553,16 @@ async def list_classes(
     os_rows = (await db.execute(select(ClientStatus.client_id, ClientStatus.os_name))).all()
     os_by_client = {cid: (osn or "") for cid, osn in os_rows}
 
+    # 班级 → 课表资源名（cp_classNN）。面板的「班级下拉」必须显示**班级名**并据此
+    # 去取该班课表；若只给班级 id / 资源集 id，前端就只能退回去列 ClassPlan 资源名
+    # （default_classplan / cp_class01…），于是默认选中一个**空课表**资源，
+    # 表现为「课表页打开是空的、而且不知道自己在看哪个班」。
+    # 一次查询批量取回，避免 N+1。
+    rs_rows = (
+        await db.execute(select(ClassResourceSet.resource_set_id, ClassResourceSet.class_plan))
+    ).all()
+    plan_by_rs = {rs: (cp or "") for rs, cp in rs_rows}
+
     out = []
     for cls in rows:
         devs = dev_by_class.get(cls.id, [])
@@ -568,6 +578,7 @@ async def list_classes(
                 "name": cls.name,
                 "code": cls.code,
                 "display_code": combine_device_label(cls.code or cls.name, dominant_os),
+                "class_plan": plan_by_rs.get(cls.resource_set_id or "", ""),
                 "graduation_year": cls.graduation_year,
                 "class_number": cls.class_number,
                 "resource_set_id": cls.resource_set_id,
