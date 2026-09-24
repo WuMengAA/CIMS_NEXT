@@ -106,7 +106,7 @@ class _ColorFormatter(logging.Formatter):
         return result
 
 
-def setup_logging(*, level: int = logging.INFO) -> None:
+def setup_logging(*, level: int = logging.INFO, console_level: int | None = None) -> None:
     """初始化全局日志系统。
 
     - 配置 root logger
@@ -114,10 +114,16 @@ def setup_logging(*, level: int = logging.INFO) -> None:
     - 同时输出到终端（带颜色）和文件（纯文本）
 
     Args:
-        level: 日志级别，默认 INFO。
+        level: 文件日志级别，默认 INFO（保留可查性）。
+        console_level: 终端日志级别，默认取 ``max(level, WARNING)``——
+            终端不刷屏（心跳/轮询的 INFO 不再刷屏），文件仍完整落盘，
+            排障时查文件不受影响。
     """
     # 确保日志目录存在
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if console_level is None:
+        console_level = max(level, logging.WARNING)
 
     # root logger
     root = logging.getLogger()
@@ -127,7 +133,7 @@ def setup_logging(*, level: int = logging.INFO) -> None:
 
     # ---- 终端 handler（带颜色） ----
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
+    console_handler.setLevel(console_level)
     console_fmt = _ColorFormatter(_LOG_FORMAT, datefmt=_LOG_DATE_FMT)
     console_handler.setFormatter(console_fmt)
     console_handler.addFilter(_PortTagFilter(PORT_TAG_SYSTEM))

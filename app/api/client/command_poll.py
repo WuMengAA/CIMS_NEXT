@@ -76,7 +76,9 @@ async def poll_queued_commands(
     rows = (await db.execute(sel)).all()
 
     if not rows:
-        logger.info("[%s][client=%s] 命令轮询: 无待执行命令", slug, client_id)
+        # 例行空结果：每台设备每轮询周期都会触发一次，属纯噪音，降为 DEBUG
+        #（文件级别仍为 INFO 时，这一行不再落盘；真正值得记录的是「有命令」与异常）
+        logger.debug("[%s][client=%s] 命令轮询: 无待执行命令", slug, client_id)
         return {"client_id": client_id, "count": 0, "commands": []}
 
     ids = [r.id for r in rows]
