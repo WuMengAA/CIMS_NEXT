@@ -20,7 +20,8 @@ from fastapi.responses import Response
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.tenant.context import get_tenant_id
+from app.core.tenant.context import get_tenant_id, get_schema, safe_identifier, schema_ctx, set_search_path
+from app.core.config import DEFAULT_ACCOUNT_SLUG
 from app.models.session import get_db
 from app.models.class_model import (
     Class,
@@ -34,7 +35,7 @@ from app.models.class_model import (
     make_class_code,
     make_class_id,
 )
-from app.models.client import ClientProfile, ClientStatus
+from app.models.client import ClientProfile, ClientStatus, ClientRecord
 from app.models.command_queue import CommandQueueRecord
 from app.models.custom_role import CustomRole
 from app.models.user import User
@@ -44,7 +45,26 @@ from app.api.command.version_check import check_version
 from app.api.command.timetable_validator import validate_classplan_references
 from app.services.schedule_importer import DEFAULT_GROUP_GUID, GLOBAL_GROUP_GUID
 
-router = APIRouter()
+async def _ensure_class_tenant(db: AsyncSession = Depends(get_db)) -> None:
+    """把会话 search_path 钉到当前租户（与 scheduled_broadcast._ensure_tenant 同口径）。
+
+    动机：8097 的 /class/* 经网站代理转发时为 `/class/...`（**无** /accounts/{id}/ 前缀），
+    此刻 AccountContextMiddleware 不会注入租户 Schema，schema_ctx 回落到默认 "public"。
+    若不显式设置，ORM 的 `select(Class)` 会去查 `public.classes` —— 而业务表已随
+    租户隔离重构迁到 `tenant_<slug>.classes`，`public.classes` 仅剩一张空壳（已 rename
+    成 `_legacy_classes`）。结果是 `list_classes` / 单班查询等**全部 500 逻辑熔断**，
+    面板班级下拉拿不到数据、静默降级成演示班级。
+
+    规则：优先用中间件已显式设置的租户 Schema；为空/为 public 时回退到
+    DEFAULT_ACCOUNT_SLUG（面板默认目标租户，与 .env 一致），保证读写恒定落同一租户。
+    """
+    schema = schema_ctx.get()
+    if not schema or schema == "public":
+        schema = f"tenant_{DEFAULT_ACCOUNT_SLUG}"
+    await set_search_path(db, schema)
+
+
+router = APIRouter(dependencies=[Depends(_ensure_class_tenant)])
 
 # 审核门槛：角色 priority ≥ 该值视为「可审核」（管理员/所有者）。
 # 后续若新增独立「审核」角色，只要其 priority 落在此区间即自动生效，无需改代码。
@@ -198,7 +218,16 @@ async def create_class(
       · 审核人（管理员/所有者）创建 → 直接 `approved`；
       · 普通用户创建 → `pending`（**待审**，通过审核前不允许绑定设备）。
     """
-    tid = get_tenant_id()
+    # 租户守卫：非 /accounts/ 前缀路径（如经网站代理转发的 /class/...）下
+    # AccountContextMiddleware 不会设置 tenant_ctx —— 直接 get_tenant_id() 会抛
+    # RuntimeError("No tenant context set")，建班/审核等写操作全部 500 逻辑熔断
+    # （线上实测 2026-09-25）。此处用 _ensure_class_tenant 已兜底的 schema 反推
+    # （tenant_<slug> → slug），与 8097 非前缀路径的租户语义保持一致。
+    schema = get_schema() or ""
+    if schema.startswith("tenant_"):
+        tid = schema[len("tenant_") :]
+    else:
+        tid = "" if not schema or schema == "public" else schema
     if not tid:
         raise HTTPException(400, "租户上下文缺失")
 
@@ -636,8 +665,25 @@ async def assign_device_to_class(
     if not reviewer and owner and owner != actor:
         raise HTTPException(403, "无权操作他人创建的班级")
 
+    # 方案 B：面板传入的 client_id 可能是 uid 或主机名，先收敛成稳定 uid 再解析档案，
+    # 改名（主机名变）也始终命中同一份档案，绑定关系不被打断。
+    uid = client_id
+    rec = (
+        await db.execute(select(ClientRecord).where(ClientRecord.uid == client_id))
+    ).scalar_one_or_none()
+    if rec is None:
+        rec = (
+            await db.execute(
+                select(ClientRecord).where(ClientRecord.client_id == client_id)
+            )
+        ).scalar_one_or_none()
+    if rec is not None:
+        uid = rec.uid
+
     prof = (
-        await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
+        await db.execute(
+            select(ClientProfile).where(ClientProfile.client_id.in_([uid, client_id]))
+        )
     ).scalar_one_or_none()
     # 自动建档：设备可能还没上报过心跳（刚装机、或想提前预绑定），此前这里直接
     # 404「配置档案不存在」，导致面板上看得见设备却绑不了班。改为按需建空档
@@ -645,9 +691,11 @@ async def assign_device_to_class(
     # 就直接拿到本班课表，不必等现场再补一次操作。
     created_profile = False
     if not prof:
-        prof = ClientProfile(client_id=client_id)
+        prof = ClientProfile(client_id=uid)
         db.add(prof)
         created_profile = True
+    elif prof.client_id != uid:
+        prof.client_id = uid  # 旧行以主机名作主键 → 迁到稳定 uid
 
     prev = prof.class_id or ""
     if prev and prev != class_id and not force:
@@ -683,8 +731,24 @@ async def unassign_device_from_class(
     db: AsyncSession = Depends(get_db),
 ):
     """把设备移出班级（回退设备级配置）。"""
+    # 方案 B：令牌收敛为稳定 uid 再解析档案。
+    uid = client_id
+    rec = (
+        await db.execute(select(ClientRecord).where(ClientRecord.uid == client_id))
+    ).scalar_one_or_none()
+    if rec is None:
+        rec = (
+            await db.execute(
+                select(ClientRecord).where(ClientRecord.client_id == client_id)
+            )
+        ).scalar_one_or_none()
+    if rec is not None:
+        uid = rec.uid
+
     prof = (
-        await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
+        await db.execute(
+            select(ClientProfile).where(ClientProfile.client_id.in_([uid, client_id]))
+        )
     ).scalar_one_or_none()
     if not prof:
         raise HTTPException(404, f"设备 {client_id} 的配置档案不存在")
@@ -1275,7 +1339,58 @@ async def upload_class_preview(
         {"client_id": client_id, "bytes": len(raw), "size": f"{w}x{h}"},
     )
     await db.commit()
-    return {"status": "success", "class_id": class_id, "width": w, "height": h, "bytes": len(raw)}
+    return {"status": "success", "class_id": class_id, "width": w, "height": h, "bytes": len(raw)    }
+
+
+@router.get("/notice-replies")
+async def list_notice_replies(
+    request: Request,
+    notice_id: str = "",
+    limit: int = 200,
+    db: AsyncSession = Depends(get_db),
+):
+    """管理端拉取教室端经「互动弹窗」回传的回复回执。
+
+    账户级（Bearer 鉴权，租户经令牌上下文识别）。可按 notice_id 过滤单条广播的回执，
+    不传则返回本租户全部回执。回执箱用于「确认/回复」类互动广播的闭环——管理端能
+    看到每台教室大屏对「收到没、回了啥」的真实反馈。
+
+    表由设备端首条回复时惰性创建（见 client/status.py），此处同样确保存在以兼容
+    「还没人回复就想看空箱」的场景。
+    """
+    from sqlalchemy import text as _text
+
+    schema = safe_identifier(get_schema())
+    await db.execute(
+        _text(f'CREATE TABLE IF NOT EXISTS "{schema}".notice_replies ('
+              f'id SERIAL PRIMARY KEY, client_id TEXT NOT NULL, '
+              f'notice_id TEXT NOT NULL DEFAULT \'\', text TEXT NOT NULL, '
+              f'created_at TIMESTAMPTZ NOT NULL DEFAULT now())')
+    )
+    lim = min(max(int(limit), 1), 500)
+    nid = (notice_id or "").strip()
+    rows = (
+        await db.execute(
+            _text(f'SELECT id, client_id, notice_id, text, created_at '
+                  f'FROM "{schema}".notice_replies '
+                  f"WHERE (:nid = '' OR notice_id = :nid) "
+                  f"ORDER BY created_at DESC, id DESC LIMIT :lim"),
+            {"nid": nid, "lim": lim},
+        )
+    ).mappings().all()
+    return {
+        "status": "success",
+        "replies": [
+            {
+                "id": r["id"],
+                "client_id": r["client_id"],
+                "notice_id": r["notice_id"] or "",
+                "text": r["text"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
 
 
 @router.get("/{class_id}")
