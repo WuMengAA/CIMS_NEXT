@@ -228,9 +228,11 @@ async def create_class(
     #      钉到 tenant_{DEFAULT_ACCOUNT_SLUG}，所属租户即该默认账户）。
     # 注意：schema_ctx 的 ContextVar 默认值恒为 "public"（_ensure_class_tenant
     # 只改 SQL search_path 不改 ContextVar），故 schema=="public" 必须走兜底。
+    # 注意：get_tenant_id() 内部把 LookupError 转成 RuntimeError 再抛，
+    # 两类都要接（context.py:34-36 def get_tenant_id）。
     try:
         tid = get_tenant_id()
-    except LookupError:
+    except (LookupError, RuntimeError):
         tid = ""
     if not tid:
         schema = get_schema() or "public"
