@@ -221,13 +221,25 @@ async def create_class(
     # 租户守卫：非 /accounts/ 前缀路径（如经网站代理转发的 /class/...）下
     # AccountContextMiddleware 不会设置 tenant_ctx —— 直接 get_tenant_id() 会抛
     # RuntimeError("No tenant context set")，建班/审核等写操作全部 500 逻辑熔断
-    # （线上实测 2026-09-25）。此处用 _ensure_class_tenant 已兜底的 schema 反推
-    # （tenant_<slug> → slug），与 8097 非前缀路径的租户语义保持一致。
-    schema = get_schema() or ""
-    if schema.startswith("tenant_"):
-        tid = schema[len("tenant_") :]
-    else:
-        tid = "" if not schema or schema == "public" else schema
+    # （线上实测 2026-09-25）。三级解析：
+    #   ① tenant_ctx 优先（/accounts/ 前缀路径由中间件设置）；
+    #   ② 其次 schema_ctx（tenant_<slug>）；
+    #   ③ 兜底 DEFAULT_ACCOUNT_SLUG（_ensure_class_tenant 已把 search_path
+    #      钉到 tenant_{DEFAULT_ACCOUNT_SLUG}，所属租户即该默认账户）。
+    # 注意：schema_ctx 的 ContextVar 默认值恒为 "public"（_ensure_class_tenant
+    # 只改 SQL search_path 不改 ContextVar），故 schema=="public" 必须走兜底。
+    try:
+        tid = get_tenant_id()
+    except LookupError:
+        tid = ""
+    if not tid:
+        schema = get_schema() or "public"
+        if schema.startswith("tenant_"):
+            tid = schema[len("tenant_") :]
+        elif schema == "public":
+            tid = DEFAULT_ACCOUNT_SLUG
+        else:
+            tid = schema
     if not tid:
         raise HTTPException(400, "租户上下文缺失")
 
