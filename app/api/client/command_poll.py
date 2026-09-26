@@ -41,6 +41,10 @@ class AckRequest(BaseModel):
 
     command_ids: list[int]
     status: str = "done"  # done | failed，缺省 done
+    # 执行详情（人话）：如"已发起关机"/"shutdown: exit 1116"。
+    # 2026-09-25 增加——此前 detail 只进设备本地日志，服务器侧无法区分
+    # "回执 done"与"真的执行了"（reboot/shutdown 曾出现 ack done 但未生效）。
+    detail: str = ""
 
 
 @router.get("/v1/client/{client_id}/command/queued")
@@ -194,10 +198,13 @@ async def ack_commands(
         raise HTTPException(404, "没有匹配的命令")
 
     now = _now()
+    detail = (body.detail or "").strip()
     for r in rows:
         r.ack_status = body.status
         r.status = "done" if body.status == "done" else "done"
         r.ack_at = now
+        if detail:
+            r.ack_detail = detail[:2000]
     await db.commit()
 
     logger.info(

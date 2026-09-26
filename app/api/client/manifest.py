@@ -25,6 +25,7 @@ from app.models.database import (
     PolicyFile,
     ComponentsFile,
     CredentialsFile,
+    ClientRecord,
 )
 from app.api.schemas.client import ClientManifest
 from app.core.client_ip import get_client_ip_from_request
@@ -87,8 +88,29 @@ async def resolve_resource_names(db: AsyncSession, client_uid: str):
 
     优先级：班级资源集（若 class_id 非空）→ 设备自身 profile 列。
     无论走哪条路径，缺失项都回退到默认名，保证 manifest 永远能产出完整 7 源。
+
+    方案 B：传入令牌（可能是 uid 或主机名）先收敛成稳定 uid 再查档案，
+    改名（主机名变化）不会让 manifest 指向孤儿档案或丢失班级绑定。
     """
-    stmt = select(ClientProfile).where(ClientProfile.client_id == client_uid)
+    from sqlalchemy import or_
+
+    rec = (
+        await db.execute(select(ClientRecord).where(ClientRecord.uid == client_uid))
+    ).scalar_one_or_none()
+    if rec is None:
+        rec = (
+            await db.execute(
+                select(ClientRecord).where(ClientRecord.client_id == client_uid)
+            )
+        ).scalar_one_or_none()
+    resolved = rec.uid if rec is not None else client_uid
+
+    stmt = select(ClientProfile).where(
+        or_(
+            ClientProfile.client_id == resolved,
+            ClientProfile.client_id == client_uid,
+        )
+    )
     result = await db.execute(stmt)
     p = result.scalar_one_or_none()
 

@@ -12,6 +12,7 @@ from fastapi import APIRouter, Request, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.tenant.context import get_tenant_id
 from app.api.schemas.base import StatusResponse
+from app.core.auth.rbac import require_permission
 from app.models.database import get_db, CommandQueueRecord
 from app.grpc.api.Protobuf.Server import ClientCommandDeliverScRsp_pb2
 from app.grpc.api.Protobuf.Enum import Retcode_pb2, CommandTypes_pb2
@@ -60,7 +61,8 @@ _TYPE_NAMES = {
 }
 
 
-@router.post("/{client_id}/command/restart", response_model=StatusResponse)
+@router.post("/{client_id}/command/restart", response_model=StatusResponse,
+             dependencies=[Depends(require_permission("command.execute"))])
 async def restart_app(
     client_id: str, request: Request, db: AsyncSession = Depends(get_db)
 ):
@@ -68,7 +70,8 @@ async def restart_app(
     return await _push_cmd(request, client_id, CommandTypes_pb2.RestartApp, db)
 
 
-@router.post("/{client_id}/command/update-data", response_model=StatusResponse)
+@router.post("/{client_id}/command/update-data", response_model=StatusResponse,
+               dependencies=[Depends(require_permission("command.execute"))])
 async def force_sync(
     client_id: str, request: Request, db: AsyncSession = Depends(get_db)
 ):

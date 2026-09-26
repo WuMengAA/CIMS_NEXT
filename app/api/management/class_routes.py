@@ -21,6 +21,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.tenant.context import get_tenant_id, get_schema, safe_identifier, schema_ctx, set_search_path
+from app.core.auth.rbac import require_permission
 from app.core.config import DEFAULT_ACCOUNT_SLUG
 from app.models.session import get_db
 from app.models.class_model import (
@@ -197,7 +198,7 @@ def _jpeg_size(raw: bytes) -> tuple[int, int] | None:
     return None
 
 
-@router.post("/create")
+@router.post("/create", dependencies=[Depends(require_permission("client.write"))])
 async def create_class(
     request: Request,
     class_id: str = "",
@@ -334,7 +335,7 @@ async def list_pending_classes(
     }
 
 
-@router.post("/{class_id}/review")
+@router.post("/{class_id}/review", dependencies=[Depends(require_permission("client.write"))])
 async def review_class(
     class_id: str,
     request: Request,
@@ -638,7 +639,7 @@ async def list_classes(
     return out
 
 
-@router.post("/device/assign")
+@router.post("/device/assign", dependencies=[Depends(require_permission("client.write"))])
 async def assign_device_to_class(
     request: Request,
     class_id: str,
@@ -738,7 +739,7 @@ async def assign_device_to_class(
     }
 
 
-@router.post("/device/unassign")
+@router.post("/device/unassign", dependencies=[Depends(require_permission("client.write"))])
 async def unassign_device_from_class(
     request: Request,
     client_id: str,
@@ -781,8 +782,8 @@ async def unassign_device_from_class(
     return {"status": "success", "client_id": client_id, "class_id": "", "previous_class_id": prev}
 
 
-@router.post("/{class_id}/resource/{resource_type}/write")
-@router.put("/{class_id}/resource/{resource_type}/write")
+@router.post("/{class_id}/resource/{resource_type}/write", dependencies=[Depends(require_permission("client.write"))])
+@router.put("/{class_id}/resource/{resource_type}/write", dependencies=[Depends(require_permission("client.write"))])
 async def write_class_resource(
     class_id: str,
     resource_type: str,
@@ -1022,7 +1023,7 @@ async def get_class_schedule(class_id: str, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.post("/{class_id}/command/{command_type}")
+@router.post("/{class_id}/command/{command_type}", dependencies=[Depends(require_permission("command.execute"))])
 async def broadcast_to_class(
     class_id: str,
     command_type: str,
@@ -1064,7 +1065,7 @@ async def broadcast_to_class(
     }
 
 
-@router.post("/{class_id}/activate")
+@router.post("/{class_id}/activate", dependencies=[Depends(require_permission("client.write"))])
 async def activate_class_on_devices(
     class_id: str,
     db: AsyncSession = Depends(get_db),
@@ -1302,7 +1303,7 @@ async def get_class_preview(class_id: str, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.post("/{class_id}/preview")
+@router.post("/{class_id}/preview", dependencies=[Depends(require_permission("client.write"))])
 async def upload_class_preview(
     class_id: str,
     request: Request,
@@ -1356,7 +1357,7 @@ async def upload_class_preview(
     return {"status": "success", "class_id": class_id, "width": w, "height": h, "bytes": len(raw)    }
 
 
-@router.get("/notice-replies")
+@router.get("/notice-replies", dependencies=[Depends(require_permission("client.read"))])
 async def list_notice_replies(
     request: Request,
     notice_id: str = "",
@@ -1374,7 +1375,12 @@ async def list_notice_replies(
     """
     from sqlalchemy import text as _text
 
-    schema = safe_identifier(get_schema())
+    # schema 落点：/class/* 无 /accounts 前缀时 schema_ctx 为 public，
+    # 必须回退 DEFAULT_ACCOUNT_SLUG（与 _ensure_class_tenant 同口径）。
+    _schema = schema_ctx.get()
+    if not _schema or _schema == "public":
+        _schema = f"tenant_{DEFAULT_ACCOUNT_SLUG}"
+    schema = safe_identifier(_schema)
     await db.execute(
         _text(f'CREATE TABLE IF NOT EXISTS "{schema}".notice_replies ('
               f'id SERIAL PRIMARY KEY, client_id TEXT NOT NULL, '
@@ -1400,6 +1406,65 @@ async def list_notice_replies(
                 "client_id": r["client_id"],
                 "notice_id": r["notice_id"] or "",
                 "text": r["text"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/command-completions", dependencies=[Depends(require_permission("client.read"))])
+async def list_command_completions(
+    request: Request,
+    client_id: str = "",
+    action: str = "",
+    limit: int = 200,
+    db: AsyncSession = Depends(get_db),
+):
+    """管理端拉取教室端经「执行回执」上报的动作结果。
+
+    账户级（Bearer 鉴权，租户经令牌上下文识别）。可按 client_id / action 过滤，
+    不传则返回本租户全部回执。回执箱用于「被控端完成操作后给操控端上报响应」的闭环
+    —— 操控端能看到每台设备对截图/锁屏/远控/关机等指令的「已执行（成功/失败+原因）」。
+    表由设备端首条回执时惰性创建（见 client/status.py），此处同样确保存在。
+    """
+    from sqlalchemy import text as _text
+
+    # 同上：schema_ctx 在 /class/* 下默认 public，回退 DEFAULT_ACCOUNT_SLUG。
+    _schema = schema_ctx.get()
+    if not _schema or _schema == "public":
+        _schema = f"tenant_{DEFAULT_ACCOUNT_SLUG}"
+    schema = safe_identifier(_schema)
+    await db.execute(
+        _text(f'CREATE TABLE IF NOT EXISTS "{schema}".command_completions ('
+              f'id SERIAL PRIMARY KEY, client_id TEXT NOT NULL, '
+              f'action TEXT NOT NULL DEFAULT \'\', ok BOOLEAN NOT NULL DEFAULT TRUE, '
+              f'detail TEXT NOT NULL DEFAULT \'\', ts BIGINT NOT NULL DEFAULT 0, '
+              f'created_at TIMESTAMPTZ NOT NULL DEFAULT now())')
+    )
+    lim = min(max(int(limit), 1), 500)
+    cid = (client_id or "").strip()
+    act = (action or "").strip()
+    rows = (
+        await db.execute(
+            _text(f'SELECT id, client_id, action, ok, detail, ts, created_at '
+                  f'FROM "{schema}".command_completions '
+                  f"WHERE (:cid = '' OR client_id = :cid) "
+                  f"AND (:act = '' OR action = :act) "
+                  f"ORDER BY created_at DESC, id DESC LIMIT :lim"),
+            {"cid": cid, "act": act, "lim": lim},
+        )
+    ).mappings().all()
+    return {
+        "status": "success",
+        "completions": [
+            {
+                "id": r["id"],
+                "client_id": r["client_id"],
+                "action": r["action"] or "",
+                "ok": bool(r["ok"]),
+                "detail": r["detail"] or "",
+                "ts": int(r["ts"] or 0),
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             }
             for r in rows

@@ -133,8 +133,15 @@ async def admin_headers(admin_token):
 
 @pytest_asyncio.fixture()
 async def test_superadmin_user():
-    """确保测试超管用户存在并返回其信息。"""
+    """确保测试超管用户存在并返回其信息。
+
+    2026-09-26 补：require_permission 走「账户成员制」—— owner 角色在
+    AccountMember 里才能拿到 {"*"} 全权限。此前只建 User 不建成员，
+    权限补全后测试超管被 403（因为它不是任何账户的 owner）。
+    这里同步建 AccountMember(owner)，与真实部署的「超管=账户 owner」一致。
+    """
     from app.models.user import User
+    from app.models.account_member import AccountMember
     from app.services.crypto.hasher import hash_password
     from sqlalchemy import select
 
@@ -152,6 +159,25 @@ async def test_superadmin_user():
                     role_code="superadmin",
                     is_active=True,
                     created_at=datetime.now(timezone.utc),
+                )
+            )
+            await db.commit()
+        # 账户成员（owner）：require_permission 以此判定 {"*"} 全权限
+        member = (
+            await db.execute(
+                select(AccountMember).where(
+                    AccountMember.user_id == user_id,
+                    AccountMember.account_id == TEST_ACCOUNT_ID,
+                )
+            )
+        ).scalar_one_or_none()
+        if member is None:
+            db.add(
+                AccountMember(
+                    user_id=user_id,
+                    account_id=TEST_ACCOUNT_ID,
+                    role_in_account="owner",
+                    joined_at=datetime.now(timezone.utc),
                 )
             )
             await db.commit()

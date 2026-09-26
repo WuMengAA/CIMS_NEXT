@@ -18,6 +18,7 @@ from .user_totp import router as totp_r
 from .user_info_email import router as email_r
 from .user_info_username import router as uname_r
 from .user_password import router as pwd_r
+from .class_swap_routes import router as class_swap_r
 from .class_routes import router as class_r
 from .class_import_routes import router as class_import_r
 from .scheduled_broadcast import router as scheduled_broadcast_r
@@ -44,6 +45,10 @@ router.include_router(avail_uname_r, prefix="/user/availability", tags=["Availab
 router.include_router(email_r, prefix="/user/info", tags=["UserInfo"])
 router.include_router(uname_r, prefix="/user/info", tags=["UserInfo"])
 router.include_router(pwd_r, prefix="/user/info/password", tags=["UserInfo"])
+
+# ⚠️ /class/swap 必须挂在 /class 之前：class_r 的 `GET /class/{class_id}` 会把
+# `GET /class/swap` 当成查班级 "swap"（404），顺序反过来就永远走不到 swap 路由。
+router.include_router(class_swap_r, prefix="/class/swap", tags=["ClassSwap"])
 
 # /class/*（Phase 1 班级层）
 router.include_router(class_r, prefix="/class", tags=["Class"])

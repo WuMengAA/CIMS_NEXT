@@ -18,10 +18,11 @@ Host 头 `<slug>.<BASE_DOMAIN>` 识别租户，按 client_id 定向，无需会�
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.database import get_db, ClientProfile, ClientStatus
+from app.core.tenant.context import get_schema, safe_identifier
+from app.models.database import get_db, ClientProfile, ClientStatus, ClientRecord
 from app.models.class_model import (
     Class,
     REVIEW_APPROVED,
@@ -31,6 +32,100 @@ from app.models.class_model import (
 )
 
 router = APIRouter()
+
+
+async def resolve_device_uid(db: AsyncSession, token: str) -> str:
+    """把「设备身份令牌」收敛成稳定的 uid（方案 B 的核心）。
+
+    背景（票 #246「设备改名变成新建」）：
+
+      设备上报 / 面板操作的 ``client_id`` 路径参数，历史上有两种含义混用——
+        · 稳定的 uid（grpc ``ClientUid``），或
+        · 可变的主机名 / 展示名（grpc ``ClientId``，老师改名后随之变化）。
+
+      旧代码直接拿这个令牌当 ``ClientStatus`` / ``ClientProfile`` 的主键去查。
+      一旦改名（主机名变），路径就变了 → 查不到旧行 → INSERT 一条新设备记录，
+      旧的（还绑着班级）成了孤儿：绑定断裂、设备数虚增。
+
+    本助手按 方案 B 收敛身份：无论传入的是 uid 还是主机名，都先查 ``ClientRecord``
+    把它映射回稳定 ``uid``；映射不到（纯 HTTP 设备、尚未 grpc 注册）则原样当作 uid。
+    这样「改名 → 路径变化」只触发展示名（host）的 UPDATE，绝不再 INSERT 新设备。
+
+    返回：稳定 uid。上层用它作为 ``ClientStatus`` / ``ClientProfile`` 的键。
+    """
+    rec = (
+        await db.execute(select(ClientRecord).where(ClientRecord.uid == token))
+    ).scalar_one_or_none()
+    if rec is not None:
+        return rec.uid
+    rec = (
+        await db.execute(select(ClientRecord).where(ClientRecord.client_id == token))
+    ).scalar_one_or_none()
+    if rec is not None:
+        return rec.uid
+    return token
+
+
+async def _get_or_create_by_uid(
+    db: AsyncSession, model, uid: str, token: str
+):
+    """按稳定 uid 取/建设备行，并就地把旧行的「主机名主键」迁成 uid。
+
+    兼容历史数据：旧行可能以原始令牌（主机名）作主键。命中时若主键仍是令牌，
+    则改挂到 uid，避免改名后出现「旧主机名行 + 新 uid 行」两条记录。
+    """
+    row = (
+        await db.execute(
+            select(model).where(model.client_id.in_([uid, token]))
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = model(client_id=uid)
+        db.add(row)
+    elif row.client_id != uid:
+        row.client_id = uid
+    return row
+
+
+# 租户业务表（互动广播回执）：设备端回复与管理端拉取共用，按租户 schema 隔离。
+_NOTICE_REPLY_DDL = (
+    "id SERIAL PRIMARY KEY,"
+    " client_id TEXT NOT NULL,"
+    " notice_id TEXT NOT NULL DEFAULT '',"
+    " text TEXT NOT NULL,"
+    " created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+)
+
+# 设备执行回执表（截图/锁屏/远控等动作执行结果的上报落点）。
+# 与 notice_replies 同模式：设备端按 Host 头识别租户，落租户业务表，
+# 操控端经管理端接口按 class/client 拉取。
+_COMPLETION_DDL = (
+    "id SERIAL PRIMARY KEY,"
+    " client_id TEXT NOT NULL,"
+    " action TEXT NOT NULL DEFAULT '',"
+    " ok BOOLEAN NOT NULL DEFAULT TRUE,"
+    " detail TEXT NOT NULL DEFAULT '',"
+    " ts BIGINT NOT NULL DEFAULT 0,"
+    " created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+)
+
+
+async def _ensure_completion_table(db: AsyncSession) -> str:
+    """惰性建表：返回当前租户 schema 名（已带双引号，可直接拼 SQL）。"""
+    schema = safe_identifier(get_schema())
+    await db.execute(
+        text(f'CREATE TABLE IF NOT EXISTS "{schema}".command_completions ({_COMPLETION_DDL})')
+    )
+    return schema
+
+
+async def _ensure_notice_reply_table(db: AsyncSession) -> str:
+    """惰性建表：返回当前租户 schema 名（已带双引号，可直接拼 SQL）。"""
+    schema = safe_identifier(get_schema())
+    await db.execute(
+        text(f'CREATE TABLE IF NOT EXISTS "{schema}".notice_replies ({_NOTICE_REPLY_DDL})')
+    )
+    return schema
 
 # 心跳间隔的上游约定（秒）。面板以 REPORTED_FRESH_SECONDS 为在线判定阈值：
 # 超过这个时长没有任何心跳，即认为设备离线。取 3 倍于插件默认上报间隔（20s），
@@ -67,6 +162,10 @@ async def report_client_status(
     slug = getattr(request.state, "tenant_slug", "Unknown")
     body = body or {}
 
+    # 方案 B：把传入令牌（可能是 uid 或主机名）收敛成稳定 uid，作为设备唯一身份键。
+    # 改名只改 host/展示名，绝不新建设备行。
+    uid = await resolve_device_uid(db, client_id)
+
     # 客户端 IP：优先 X-Forwarded-For 首段（经反代时才是真实来源）
     ip = ""
     fwd = request.headers.get("x-forwarded-for", "")
@@ -88,12 +187,7 @@ async def report_client_status(
     plugins = body.get("plugins")
     extra = body.get("extra")
 
-    row = (
-        await db.execute(select(ClientStatus).where(ClientStatus.client_id == client_id))
-    ).scalar_one_or_none()
-    if row is None:
-        row = ClientStatus(client_id=client_id)
-        db.add(row)
+    row = await _get_or_create_by_uid(db, ClientStatus, uid, client_id)
 
     row.host = str(body.get("host") or row.host or "")[:255]
     row.ip = str(ip or row.ip or "")[:64]
@@ -143,16 +237,10 @@ async def report_client_status(
     #
     # 这里按最小侵入自愈：档案已存在则**一个字段都不动**（绝不覆盖已指派的班级），
     # 不存在才按默认资源名建一条空档（class_id 留空，等管理端指派）。
-    prof = (
-        await db.execute(
-            select(ClientProfile).where(ClientProfile.client_id == client_id)
-        )
-    ).scalar_one_or_none()
-    if prof is None:
-        db.add(ClientProfile(client_id=client_id))
+    prof = await _get_or_create_by_uid(db, ClientProfile, uid, client_id)
 
     await db.commit()
-    return {"client_id": client_id, "reported": True, "server_time": row.reported_at.isoformat()}
+    return {"client_id": uid, "reported": True, "server_time": row.reported_at.isoformat()}
 
 
 @router.get("/v1/client/{client_id}/status")
@@ -171,12 +259,19 @@ async def read_client_status(
     """
     slug = getattr(request.state, "tenant_slug", "Unknown")
 
+    # 方案 B：传入令牌收敛成稳定 uid 再查，改名（路径变）也能命中同一条记录。
+    uid = await resolve_device_uid(db, client_id)
+
     row = (
-        await db.execute(select(ClientStatus).where(ClientStatus.client_id == client_id))
+        await db.execute(
+            select(ClientStatus).where(ClientStatus.client_id.in_([uid, client_id]))
+        )
     ).scalar_one_or_none()
 
     profile = (
-        await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
+        await db.execute(
+            select(ClientProfile).where(ClientProfile.client_id.in_([uid, client_id]))
+        )
     ).scalar_one_or_none()
 
     import json as _json
@@ -291,11 +386,15 @@ async def register_device_class(
             f"班级「{cls.name or cls.id}」尚未通过审核，暂不能绑定。",
         )
 
+    # 方案 B：令牌收敛为稳定 uid 再解析设备档案。
+    uid = await resolve_device_uid(db, client_id)
     prof = (
-        await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
+        await db.execute(
+            select(ClientProfile).where(ClientProfile.client_id.in_([uid, client_id]))
+        )
     ).scalar_one_or_none()
     if prof is None:
-        prof = ClientProfile(client_id=client_id)
+        prof = ClientProfile(client_id=uid)
         db.add(prof)
 
     prev = prof.class_id or ""
@@ -335,8 +434,12 @@ async def unregister_device_class(
     与 register 同一信任链（租户 + client_id 定向）。解绑后下次心跳回读
     bound=false，插件端 OOBE 引导会重新弹出，引导教师重新选班。
     """
+    # 方案 B：令牌收敛为稳定 uid 再解析设备档案。
+    uid = await resolve_device_uid(db, client_id)
     prof = (
-        await db.execute(select(ClientProfile).where(ClientProfile.client_id == client_id))
+        await db.execute(
+            select(ClientProfile).where(ClientProfile.client_id.in_([uid, client_id]))
+        )
     ).scalar_one_or_none()
     if prof is None:
         raise HTTPException(404, f"设备 {client_id} 的配置档案不存在")
@@ -351,6 +454,73 @@ async def unregister_device_class(
         "registered": False,
         "bound": False,
     }
+
+
+@router.post("/v1/client/{client_id}/notice-reply")
+async def post_notice_reply(
+    request: Request,
+    client_id: str,
+    body: dict = Body(default_factory=dict),
+    db: AsyncSession = Depends(get_db),
+):
+    """教室端经「互动弹窗（确认/回复）」回复后回传的回执。
+
+    与 register/unregister 同一信任链：租户经 Host 头识别、client_id 定向，无需会话凭证。
+    回执落 tenant 业务表 notice_replies，供管理端经 GET /class/notice-replies 拉取。
+
+    门控：空回复直接 400（防止轮询/误触把空行打进回执箱）；超长截断到 2000 字。
+    """
+    raw = body or {}
+    reply_text = (raw.get("text") or "").strip()
+    if not reply_text:
+        raise HTTPException(400, "回复内容为空")
+    if len(reply_text) > 2000:
+        reply_text = reply_text[:2000]
+    notice_id = (raw.get("notice_id") or "").strip()[:200]
+
+    schema = await _ensure_notice_reply_table(db)
+    await db.execute(
+        text(f'INSERT INTO "{schema}".notice_replies (client_id, notice_id, text) '
+             f"VALUES (:cid, :nid, :txt)"),
+        {"cid": client_id, "nid": notice_id, "txt": reply_text},
+    )
+    await db.commit()
+    return {"status": "success", "client_id": client_id, "notice_id": notice_id}
+
+
+@router.post("/v1/client/{client_id}/completions")
+async def post_command_completion(
+    request: Request,
+    client_id: str,
+    body: dict = Body(default_factory=dict),
+    db: AsyncSession = Depends(get_db),
+):
+    """教室端执行一条指令（截图/锁屏/远控/关机等）后的**执行回执**。
+
+    与 notice-reply / status 同一信任链：租户经 Host 头识别、client_id 定向，无需会话凭证。
+    回执落租户业务表 command_completions，供操控端/面板经管理端接口按 class/client 拉取，
+    从而区分「指令已下发」与「设备已执行（成功/失败+原因）」—— 这是
+    「被控端完成操作后给操控端上报响应」的服务端落点。
+
+    门控：action 为空直接 400（防轮询误触）；detail 截断到 500 字。
+    """
+    raw = body or {}
+    action = (raw.get("action") or "").strip()
+    if not action:
+        raise HTTPException(400, "缺少 action")
+    ok = bool(raw.get("ok", True))
+    detail = (raw.get("detail") or "").strip()[:500]
+    ts = int(raw.get("ts") or 0)
+
+    schema = await _ensure_completion_table(db)
+    await db.execute(
+        text(f'INSERT INTO "{schema}".command_completions '
+             f"(client_id, action, ok, detail, ts) "
+             f"VALUES (:cid, :act, :ok, :det, :ts)"),
+        {"cid": client_id, "act": action, "ok": ok, "det": detail, "ts": ts},
+    )
+    await db.commit()
+    return {"status": "success", "client_id": client_id, "action": action, "ok": ok}
 
 
 @router.get("/v1/client/{client_id}/p2p")

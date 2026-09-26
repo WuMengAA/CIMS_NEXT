@@ -104,3 +104,9 @@ async def _startup(app: FastAPI):
     app.state.scheduler_stop = stop_event
     app.state.scheduler_task = asyncio.create_task(run_scheduler(stop_event))
     logger.info("定时广播调度器任务已创建")
+
+    # 自助切班 · 到期自动回退巡检（复用同一个 stop_event，_shutdown 一并停）
+    from app.services.class_swap_auto import run_swap_auto_rollback
+
+    app.state.swap_rollback_task = asyncio.create_task(run_swap_auto_rollback(stop_event))
+    logger.info("自助切班到期自动回退巡检任务已创建")

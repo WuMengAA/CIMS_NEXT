@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Body, Depends, HTTPException
+from app.core.auth.rbac import require_permission
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -81,7 +82,7 @@ async def list_schedules(db: AsyncSession = Depends(get_db)):
     return {"status": "success", "count": len(rows), "items": [_to_dict(r) for r in rows]}
 
 
-@router.post("/create")
+@router.post("/create", dependencies=[Depends(require_permission("command.execute"))])
 async def create_schedule(
     payload: dict = Body(...),
     db: AsyncSession = Depends(get_db),
@@ -126,7 +127,7 @@ async def create_schedule(
     return {"status": "success", "item": _to_dict(sch)}
 
 
-@router.put("/{sid}")
+@router.put("/{sid}", dependencies=[Depends(require_permission("command.execute"))])
 async def update_schedule(
     sid: int,
     payload: dict = Body(...),
@@ -174,7 +175,7 @@ async def update_schedule(
     return {"status": "success", "item": _to_dict(sch)}
 
 
-@router.post("/{sid}/toggle")
+@router.post("/{sid}/toggle", dependencies=[Depends(require_permission("command.execute"))])
 async def toggle_schedule(
     sid: int,
     enabled: bool = Body(default=True, embed=True),
@@ -194,7 +195,7 @@ async def toggle_schedule(
     return {"status": "success", "enabled": sch.enabled, "next_run_at": sch.next_run_at.isoformat() if sch.next_run_at else None}
 
 
-@router.post("/{sid}/fire-now")
+@router.post("/{sid}/fire-now", dependencies=[Depends(require_permission("command.execute"))])
 async def fire_now(sid: int, db: AsyncSession = Depends(get_db)):
     """手动立即触发一次（便于测试，不消耗 recurring 周期语义：once 同正常触发）。"""
     await _ensure_tenant(db)
@@ -213,7 +214,7 @@ async def fire_now(sid: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.delete("/{sid}")
+@router.delete("/{sid}", dependencies=[Depends(require_permission("command.execute"))])
 async def delete_schedule(sid: int, db: AsyncSession = Depends(get_db)):
     """删除一条配置。"""
     await _ensure_tenant(db)

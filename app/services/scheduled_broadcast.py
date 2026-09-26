@@ -27,24 +27,31 @@ TICK_INTERVAL = 30  # 秒
 
 
 def compute_next_run(sch: ScheduledBroadcast, base: datetime | None = None) -> datetime | None:
-    """计算下一次触发时间（UTC）。once 直接返回锚定时间；daily/weekly 按 time 分量递推。"""
+    """计算下一次触发时间（返回 UTC）。once 直接返回锚定时间；daily/weekly 按墙上时钟递推。
+
+    时区铁律：`run_at` 是 tz-aware 的（面板传的是本地时间，service 里统一转 UTC 存库）。
+    递推时必须**先按 run_at 的时区取墙上时钟，再装回该时区**，不能把 +08 的 13:50 当成
+    UTC 13:50 —— 否则「每天 13:50」会变成每天 21:50（+8h 漂移，2026-09-21 用户实测踩中）。
+    """
     base = base or datetime.now(timezone.utc)
     if sch.schedule_type == "once":
         return sch.run_at
     if sch.run_at is None:
         return None
-    t = sch.run_at.time().replace(tzinfo=timezone.utc)
-    candidate = datetime.combine(base.date(), t)
+    tz = sch.run_at.tzinfo or timezone.utc
+    wall = sch.run_at.astimezone(tz).timetz()  # 用户眼中的墙上时钟（如 13:50）——注意用 timetz() 保留 tzinfo，time() 会丢
+    base_in_tz = base.astimezone(tz)
+    candidate = datetime.combine(base_in_tz.date(), wall)
     if sch.schedule_type == "daily":
-        if candidate <= base:
+        if candidate <= base_in_tz:
             candidate += timedelta(days=1)
-        return candidate
+        return candidate.astimezone(timezone.utc)
     # weekly
     wd = int(sch.weekday if sch.weekday is not None else 0) % 7
     days_ahead = (wd - candidate.weekday()) % 7
-    if days_ahead == 0 and candidate <= base:
+    if days_ahead == 0 and candidate <= base_in_tz:
         days_ahead = 7
-    return candidate + timedelta(days=days_ahead)
+    return (candidate + timedelta(days=days_ahead)).astimezone(timezone.utc)
 
 
 async def _fire_schedule(sch: ScheduledBroadcast, db, now: datetime) -> int:

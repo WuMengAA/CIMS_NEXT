@@ -4,7 +4,8 @@
 """
 
 import uuid
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends
+from app.core.auth.rbac import require_permission
 from app.core.tenant.context import get_tenant_id
 from app.grpc.api.Protobuf.Server import ClientCommandDeliverScRsp_pb2
 from app.grpc.api.Protobuf.Command import GetClientConfig_pb2
@@ -13,7 +14,8 @@ from app.grpc.api.Protobuf.Enum import Retcode_pb2, CommandTypes_pb2
 router = APIRouter()
 
 
-@router.get("/{client_id}/command/get-config")
+@router.get("/{client_id}/command/get-config",
+         dependencies=[Depends(require_permission("config.read"))])
 async def fetch_runtime_config(client_id: str, config_type: int, request: Request):
     """请求终端上报其当前运行的配置快照。"""
     servicer = getattr(request.app.state, "command_servicer", None)

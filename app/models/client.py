@@ -106,3 +106,10 @@ class ClientProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # 设备级动作限制（v2.2 控制限制）：JSON 数组，存储被禁用的 stelarith_task 动作
+    # （如 shutdown / reboot）。由操控端/管理端设置，「关键逻辑在服务端」——
+    # 下发 stelarith_task 前由服务端校验，被禁动作直接拒绝，不落到设备端。
+    action_restrictions: Mapped[str] = mapped_column(
+        String, default="[]", server_default=text("[]"),
+        comment="禁止执行的 stelarith 动作列表（JSON 数组）"
+    )

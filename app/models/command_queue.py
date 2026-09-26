@@ -48,3 +48,5 @@ class CommandQueueRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     ack_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 客户端回执的执行详情（人话）。2026-09-25 增加：用于区分"回执 done"与"真的执行了"。
+    ack_detail: Mapped[str] = mapped_column(Text, default="", server_default=text("''"))
